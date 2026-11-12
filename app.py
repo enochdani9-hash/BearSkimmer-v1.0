@@ -9,15 +9,15 @@ from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "bearskimmer_v1_state.json"
+STATE_FILE = "bearskimmer_v1_2_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
-# Liquid Mid/Large-Cap Futures Universe (Safe from micro-cap random +100% squeezes)
+# Liquid Mid/Large-Cap Futures Universe
 BEAR_UNIVERSE = [
     "SUI_USDT", "SOL_USDT", "DOGE_USDT", "XRP_USDT", "ADA_USDT",
     "NEAR_USDT", "AVAX_USDT", "LINK_USDT", "FET_USDT", "DOT_USDT",
@@ -48,18 +48,18 @@ def fmt_px(val):
 
 
 DEFAULT_STATE = {
-    "mode": "PAPER",  # Starts in $100 Paper Simulation Mode
+    "mode": "PAPER",
     "auto_pilot": True,
     "max_short_slots": 4,
     "slot_size_usdt": 12.0,
     "min_bear_score": 68,
-    "skim_profit_pct": 1.00,     # +1.00% Net Profit on the Short
-    "trail_bounce_pct": 0.22,    # Locks profit if price bounces +0.22% from bottom
-    "futures_fee_buffer_pct": 0.12,  # Gate.io Futures round-trip taker fee (~0.10%-0.12%)
+    "skim_profit_pct": 1.00,
+    "trail_bounce_pct": 0.22,
+    "futures_fee_buffer_pct": 0.12,
     "api_key": os.environ.get("GATE_API_KEY", "").strip(),
     "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
     "api_connected": False,
-    "api_status_msg": "Paper Mode Active ($100 Sim) — Paste Keys for Live Futures",
+    "api_status_msg": "Paper Mode Active ($100 Sim) — Paste Keys Below for Live Futures",
     "live_futures_usdt": 0.0,
     "paper_usdt_balance": 100.0,
     "short_positions": {},
@@ -92,19 +92,21 @@ def add_log(msg):
 
 def load_state():
     global STATE
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                saved = json.load(f)
-                sk = (saved.get("api_key") or "").strip()
-                ss = (saved.get("api_secret") or "").strip()
-                STATE.update(saved)
-                if sk:
-                    STATE["api_key"] = sk
-                if ss:
-                    STATE["api_secret"] = ss
-        except Exception as e:
-            add_log(f"State load notice: {e}")
+    for fn in [STATE_FILE, "bearskimmer_v1_state.json"]:
+        if os.path.exists(fn):
+            try:
+                with open(fn, "r") as f:
+                    saved = json.load(f)
+                    sk = (saved.get("api_key") or "").strip()
+                    ss = (saved.get("api_secret") or "").strip()
+                    STATE.update(saved)
+                    if sk:
+                        STATE["api_key"] = sk
+                    if ss:
+                        STATE["api_secret"] = ss
+                break
+            except Exception as e:
+                add_log(f"State load notice: {e}")
 
     ek = os.environ.get("GATE_API_KEY", "").strip()
     es = os.environ.get("GATE_API_SECRET", "").strip()
@@ -141,7 +143,6 @@ def gate_sign(method, url, query_string="", body_string="", custom_key=None, cus
 
 
 def fetch_futures_tickers(pairs):
-    """Fetches real-time Gate.io USDT Perpetual Futures tickers."""
     r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/futures/usdt/tickers", timeout=6)
     r.raise_for_status()
     wanted = set(pairs)
@@ -189,7 +190,7 @@ def fetch_futures_usdt_balance(custom_key=None, custom_secret=None):
 
 
 # =============================================================================
-# BEARISH BREAKDOWN RADAR (FINDS WEAK COINS READY TO DROP)
+# TOP-OF-BOUNCE BEARISH BREAKDOWN RADAR
 # =============================================================================
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -212,10 +213,10 @@ def calc_rsi(closes, period=14):
 
 def compute_bear_score(pair, tk):
     """
-    Computes a 0-100 'Bearish Breakdown Score':
-    - High score (70+) when Order Book Ask Walls (Sellers) > Bid Walls (Buyers),
-      5m candle is rejecting below its EMA/High, and RSI is in the sweet spot (35 to 68)
-      where it still has plenty of room to fall without being at rock bottom.
+    Computes a 0-100 'Top-of-Bounce Bear Score':
+    - Avoids shorting rock-bottom oversold dips (RSI < 38) where coins bounce up.
+    - Scores highest (70+) when a coin in a 24h downtrend has bounced into resistance
+      (RSI 46-70), shows an upper-wick rejection, and has heavy Order-Book Ask Sell Walls.
     """
     now = time.time()
     cached = BEAR_RADAR_CACHE.get(pair)
@@ -226,8 +227,8 @@ def compute_bear_score(pair, tk):
     price = tk["last"]
     rsi_14 = 50.0
     ask_sell_pct = 50.0
-    below_ema = True
-    red_candle = False
+    upper_wick_reject = False
+    near_local_high = False
 
     try:
         c_resp = HTTP_SESSION.get(
@@ -238,13 +239,16 @@ def compute_bear_score(pair, tk):
         if c_resp.status_code == 200:
             raw = c_resp.json()
             closes = [float(c["c"]) for c in raw if "c" in c]
-            opens = [float(c["o"]) for c in raw if "o" in c]
+            highs = [float(c["h"]) for c in raw if "h" in c]
+            lows = [float(c["l"]) for c in raw if "l" in c]
             if len(closes) >= 16:
                 closes[-1] = price
                 rsi_14 = calc_rsi(closes, 14)
                 sma_10 = sum(closes[-10:]) / 10.0
-                below_ema = price <= sma_10
-                red_candle = price < opens[-1]
+                # Upper wick rejection: price pushed up during the 5m bar and is rejecting off the high
+                c_rng = max(1e-12, highs[-1] - lows[-1])
+                upper_wick_reject = ((highs[-1] - price) / c_rng) >= 0.35
+                near_local_high = price >= (sma_10 * 0.998)
     except Exception:
         pass
 
@@ -263,35 +267,35 @@ def compute_bear_score(pair, tk):
     except Exception:
         pass
 
-    # 1) RSI Bearish Room-to-Fall Score (0-35 pts)
-    # Don't short if RSI < 28 (already oversold bounce risk). Best short zone is RSI 42-68 rejecting downward.
-    if rsi_14 < 28:
-        s_rsi = 8.0
-    elif 40 <= rsi_14 <= 68:
-        s_rsi = 34.0
-    elif 32 <= rsi_14 < 40:
-        s_rsi = 25.0
+    # 1) RSI Top-of-Bounce Filter (0-38 pts)
+    # Blocks shorting bottom of red candles (RSI < 38) so we don't get caught in bounces!
+    if rsi_14 < 36:
+        s_rsi = 5.0
+    elif 46 <= rsi_14 <= 72:
+        s_rsi = 38.0
+    elif 38 <= rsi_14 < 46:
+        s_rsi = 24.0
     else:
-        s_rsi = 18.0
+        s_rsi = 30.0
 
-    # 2) Order-Book Seller Pressure (Ask Walls > Bid Walls) (0-35 pts)
-    s_ob = max(5.0, min(35.0, ((ask_sell_pct - 35.0) / 35.0) * 35.0))
+    # 2) Order-Book Seller Resistance (Ask Walls > Bid Walls) (0-35 pts)
+    s_ob = max(4.0, min(35.0, ((ask_sell_pct - 35.0) / 35.0) * 35.0))
 
-    # 3) Downtrend & Red Candle Momentum (0-30 pts)
-    s_trend = (16.0 if below_ema else 6.0) + (14.0 if red_candle else 5.0)
-    if tk["change_24h"] < -1.0:
-        s_trend = min(30.0, s_trend + 5.0)
+    # 3) Upper-Wick Rejection & Macro Red Trend (0-27 pts)
+    s_reject = (12.0 if upper_wick_reject else 5.0) + (8.0 if near_local_high else 3.0)
+    if tk["change_24h"] < -0.5:
+        s_reject = min(27.0, s_reject + 7.0)
 
-    bear_score = int(round(max(1.0, min(99.0, s_rsi + s_ob + s_trend))))
+    bear_score = int(round(max(1.0, min(99.0, s_rsi + s_ob + s_reject))))
 
     if bear_score >= 74:
-        signal = "STRONG SHORT DUMP"
+        signal = "SNIPE SHORT TOP"
     elif bear_score >= 65:
-        signal = "BEARISH BREAKDOWN"
-    elif rsi_14 < 28:
-        signal = "TOO OVERSOLD — WAIT"
+        signal = "BEARISH REJECTION"
+    elif rsi_14 < 36:
+        signal = "BOTTOM DIP — DO NOT SHORT"
     else:
-        signal = "NEUTRAL CHOP"
+        signal = "WAIT FOR BOUNCE"
 
     res = {
         "pair": pair,
@@ -309,10 +313,6 @@ def compute_bear_score(pair, tk):
 
 
 def place_futures_short_order(contract, size_contracts):
-    """
-    Places a Gate.io USDT Futures Market Order.
-    Negative size = Open Short; Positive size with reduce_only = Buy Back / Close Short.
-    """
     url = f"{GATE_PREFIX}/futures/usdt/orders"
     body = {
         "contract": contract,
@@ -329,7 +329,7 @@ def place_futures_short_order(contract, size_contracts):
 
 
 # =============================================================================
-# MAIN BEARSKIMMER CYCLE (SHORT HIGH -> BUY BACK LOW ON DUMPS)
+# MAIN BEARSKIMMER EXECUTION CYCLE
 # =============================================================================
 def run_bear_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
@@ -368,7 +368,7 @@ def run_bear_cycle(force_manual=False):
             add_log(f"Futures ticker notice: {str(e)[:55]}")
             return
 
-        # 1) SCORE ALL 16 PAIRS FOR BEARISH BREAKDOWNS
+        # 1) SCORE ALL 16 PAIRS
         radar_list = []
         for pair in BEAR_UNIVERSE:
             tk = tk_map.get(pair)
@@ -378,8 +378,8 @@ def run_bear_cycle(force_manual=False):
 
         radar_list.sort(key=lambda x: x["bear_score"], reverse=True)
 
-        # 2) MANAGE ACTIVE SHORT POSITIONS (PROFIT WHEN PRICE DROPS!)
-        required_drop_pct = skim_pct + fee_buf  # e.g. 1.00% + 0.12% = -1.12% price drop needed
+        # 2) MANAGE ACTIVE SHORT POSITIONS
+        required_drop_pct = skim_pct + fee_buf
 
         for pair in list(STATE["short_positions"].keys()):
             pos = STATE["short_positions"].get(pair)
@@ -391,33 +391,32 @@ def run_bear_cycle(force_manual=False):
             margin_usdt = float(pos["margin_usdt"])
 
             pos["last_price"] = live_px
-            # Target Buyback Price is LOWER than Entry Price!
             target_buyback_px = entry_px * (1.0 - (required_drop_pct / 100.0))
             pos["target_buyback_price"] = target_buyback_px
 
-            # Short PnL Math: When live_px < entry_px, PnL is POSITIVE!
-            raw_drop_pct = ((entry_px - live_px) / entry_px) * 100.0
-            net_pnl_pct = raw_drop_pct - fee_buf
+            # Actual Coin Price Change since Entry (Negative = Price Dropped = Good for Short!)
+            coin_move_pct = ((live_px - entry_px) / entry_px) * 100.0
+            raw_drop_gain_pct = ((entry_px - live_px) / entry_px) * 100.0
+            net_pnl_pct = raw_drop_gain_pct - fee_buf
             net_pnl_usdt = margin_usdt * (net_pnl_pct / 100.0)
 
-            pos["price_drop_pct"] = round(raw_drop_pct, 2)
+            pos["coin_move_pct"] = round(coin_move_pct, 2)
+            pos["price_drop_pct"] = round(raw_drop_gain_pct, 2)
             pos["pnl_pct"] = round(net_pnl_pct, 2)
             pos["pnl_usdt"] = round(net_pnl_usdt, 4)
             pos["current_equity_usdt"] = round(margin_usdt + net_pnl_usdt, 4)
 
             should_close_short = False
 
-            # Check if price dropped below Target Buyback Price
             if live_px <= target_buyback_px:
                 if not pos.get("trailing_active"):
                     pos["trailing_active"] = True
                     pos["lowest_price"] = live_px
-                    pos["status"] = f"🔥 Trailing Dump Lock Armed @ {fmt_px(live_px)} (+{net_pnl_pct:.2f}% Profit)"
+                    pos["status"] = f"🔥 Trailing Dump Lock Armed @ {fmt_px(live_px)} (+{net_pnl_pct:.2f}% Net Profit)"
                 else:
                     if live_px < float(pos.get("lowest_price", live_px)):
                         pos["lowest_price"] = live_px
                     low_watermark = float(pos["lowest_price"])
-                    # Ceiling trigger: if price bounces +0.22% off the bottom, cash out immediately!
                     bounce_ceiling_px = min(target_buyback_px, low_watermark * (1.0 + (trail_bounce / 100.0)))
                     if live_px >= bounce_ceiling_px:
                         should_close_short = True
@@ -431,9 +430,9 @@ def run_bear_cycle(force_manual=False):
                     should_close_short = True
                 else:
                     pos["trailing_active"] = False
+                    needed_more_drop = max(0.0, ((live_px - target_buyback_px) / live_px) * 100.0)
                     pos["status"] = (
-                        f"Shorting — Waiting for -{required_drop_pct:.2f}% Drop "
-                        f"(Now: {net_pnl_pct:+.2f}% | Target: {fmt_px(target_buyback_px)})"
+                        f"Waiting for price to drop -{needed_more_drop:.2f}% to {fmt_px(target_buyback_px)}"
                     )
 
             if should_close_short:
@@ -449,13 +448,13 @@ def run_bear_cycle(force_manual=False):
                         )
                         STATE["skim_ledger"].insert(0, {
                             "time": datetime.utcnow().strftime("%H:%M:%S"),
-                            "pair": f"{pair} (PAPER SHORT)",
-                            "drop": f"-{raw_drop_pct:.2f}%",
-                            "short_to_cover": f"Short {fmt_px(entry_px)} → Covered {fmt_px(live_px)}",
+                            "pair": f"{pair} (PAPER)",
+                            "drop": f"-{raw_drop_gain_pct:.2f}%",
+                            "short_to_cover": f"{fmt_px(entry_px)} → {fmt_px(live_px)}",
                             "profit": f"+${profit_usdt:.4f}"
                         })
                         add_log(
-                            f"🩸💎 [BEAR SKIM WON][{pair}] Price dumped -{raw_drop_pct:.2f}% "
+                            f"🩸💎 [BEAR SKIM WON][{pair}] Price dropped -{raw_drop_gain_pct:.2f}% "
                             f"({fmt_px(entry_px)} → {fmt_px(live_px)}) | Banked +${profit_usdt:.4f}!"
                         )
                         STATE["short_positions"].pop(pair, None)
@@ -470,9 +469,9 @@ def run_bear_cycle(force_manual=False):
                             )
                             STATE["skim_ledger"].insert(0, {
                                 "time": datetime.utcnow().strftime("%H:%M:%S"),
-                                "pair": f"{pair} (LIVE SHORT)",
-                                "drop": f"-{raw_drop_pct:.2f}%",
-                                "short_to_cover": f"Short {fmt_px(entry_px)} → Covered {fmt_px(live_px)}",
+                                "pair": f"{pair} (LIVE)",
+                                "drop": f"-{raw_drop_gain_pct:.2f}%",
+                                "short_to_cover": f"{fmt_px(entry_px)} → {fmt_px(live_px)}",
                                 "profit": f"+${profit_usdt:.4f}"
                             })
                             add_log(
@@ -481,7 +480,7 @@ def run_bear_cycle(force_manual=False):
                             )
                             STATE["short_positions"].pop(pair, None)
 
-        # 3) OPEN NEW AUTONOMOUS SHORTS ON WEAK COINS (IF AUTO-PILOT ON)
+        # 3) OPEN NEW AUTONOMOUS SHORTS ON TOP-OF-BOUNCE REJECTIONS
         if auto_pilot and len(STATE["short_positions"]) < max_slots:
             for cand in radar_list:
                 with state_lock:
@@ -511,16 +510,17 @@ def run_bear_cycle(force_manual=False):
                             "entry_price": c_price,
                             "last_price": c_price,
                             "target_buyback_price": target_px,
+                            "coin_move_pct": 0.0,
                             "price_drop_pct": 0.0,
-                            "pnl_pct": 0.0,
-                            "pnl_usdt": 0.0,
+                            "pnl_pct": -fee_buf,
+                            "pnl_usdt": round(-slot_size * (fee_buf / 100.0), 4),
                             "bear_score": cand["bear_score"],
                             "trailing_active": False,
                             "lowest_price": c_price,
                             "status": f"1x Short Opened (Bear Score {cand['bear_score']}/100)"
                         }
                         add_log(
-                            f"🩸 [PAPER AUTO-SHORT][{c_pair}] Bear Score {cand['bear_score']}/100 "
+                            f"🩸 [PAPER AUTO-SHORT][{c_pair}] Score {cand['bear_score']}/100 "
                             f"(Sellers: {cand['ask_sell_pct']}% | RSI: {cand['rsi_14']}) — "
                             f"Shorted ${slot_size:.2f} @ {fmt_px(c_price)} (Target: {fmt_px(target_px)})"
                         )
@@ -545,9 +545,10 @@ def run_bear_cycle(force_manual=False):
                                 "entry_price": c_price,
                                 "last_price": c_price,
                                 "target_buyback_price": target_px,
+                                "coin_move_pct": 0.0,
                                 "price_drop_pct": 0.0,
-                                "pnl_pct": 0.0,
-                                "pnl_usdt": 0.0,
+                                "pnl_pct": -fee_buf,
+                                "pnl_usdt": round(-actual_notional * (fee_buf / 100.0), 4),
                                 "bear_score": cand["bear_score"],
                                 "trailing_active": False,
                                 "lowest_price": c_price,
@@ -573,7 +574,7 @@ def run_bear_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("🩸 BearSkimmer v1.0 Online — Autonomous 1x Bearish Short Skimmer ($100 Paper Sim Ready).")
+    add_log("🩸 BearSkimmer v1.2 Online — Top-of-Bounce Short Engine + Phone App Installer Ready.")
     while True:
         run_bear_cycle(force_manual=False)
         time.sleep(3.5)
@@ -591,6 +592,53 @@ def ensure_worker_alive():
 @app.before_request
 def check_worker():
     ensure_worker_alive()
+
+
+# =============================================================================
+# PWA MOBILE INSTALLER ENDPOINTS (MANIFEST, ICON, SERVICE WORKER)
+# =============================================================================
+@app.route("/manifest.json")
+def pwa_manifest():
+    manifest = {
+        "name": "BearSkimmer v1.2 Short Engine",
+        "short_name": "BearSkimmer",
+        "description": "Autonomous 1x Bearish Short Skimmer on Gate.io Futures",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#07040a",
+        "theme_color": "#ff2a5f",
+        "orientation": "portrait-primary",
+        "icons": [
+            {
+                "src": "/icon.svg",
+                "sizes": "any",
+                "type": "image/svg+xml",
+                "purpose": "any maskable"
+            }
+        ]
+    }
+    return jsonify(manifest)
+
+
+@app.route("/icon.svg")
+def pwa_icon():
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+      <rect width="512" height="512" rx="115" fill="#12071c"/>
+      <circle cx="256" cy="256" r="210" fill="none" stroke="#ff2a5f" stroke-width="18" opacity="0.85"/>
+      <path d="M150 185 L245 280 L300 225 L380 325" fill="none" stroke="#ff2a5f" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+      <polygon points="395,340 395,255 310,340" fill="#00f5a0"/>
+    </svg>"""
+    return Response(svg, mimetype="image/svg+xml")
+
+
+@app.route("/sw.js")
+def pwa_sw():
+    js = """
+    self.addEventListener('install', e => { self.skipWaiting(); });
+    self.addEventListener('activate', e => { e.waitUntil(self.clients.claim()); });
+    self.addEventListener('fetch', e => { e.respondWith(fetch(e.request).catch(() => caches.match(e.request))); });
+    """
+    return Response(js, mimetype="application/javascript")
 
 
 # =============================================================================
@@ -654,11 +702,15 @@ def api_manual_short():
     with state_lock:
         if pair in STATE["short_positions"]:
             return jsonify({"ok": False, "error": f"Already shorting {pair}"}), 400
+        max_slots = int(STATE.get("max_short_slots", 4))
+        if len(STATE["short_positions"]) >= max_slots:
+            return jsonify({"ok": False, "error": f"Max slots ({max_slots}/{max_slots}) full! Close one or increase Max Slots first."}), 400
     try:
         tk_map = fetch_futures_tickers([pair])
         c_price = tk_map[pair]["last"]
         slot_size = float(STATE.get("slot_size_usdt", 12.0))
-        req_drop = float(STATE.get("skim_profit_pct", 1.0)) + float(STATE.get("futures_fee_buffer_pct", 0.12))
+        fee_buf = float(STATE.get("futures_fee_buffer_pct", 0.12))
+        req_drop = float(STATE.get("skim_profit_pct", 1.0)) + fee_buf
         target_px = c_price * (1.0 - (req_drop / 100.0))
         with state_lock:
             avail = float(STATE.get("paper_usdt_balance", 100.0))
@@ -672,9 +724,10 @@ def api_manual_short():
                 "entry_price": c_price,
                 "last_price": c_price,
                 "target_buyback_price": target_px,
+                "coin_move_pct": 0.0,
                 "price_drop_pct": 0.0,
-                "pnl_pct": 0.0,
-                "pnl_usdt": 0.0,
+                "pnl_pct": -fee_buf,
+                "pnl_usdt": round(-slot_size * (fee_buf / 100.0), 4),
                 "bear_score": 80,
                 "trailing_active": False,
                 "lowest_price": c_price,
@@ -726,12 +779,12 @@ def api_update_config():
 @app.route("/api/sync_keys", methods=["POST"])
 def api_sync_keys():
     d = request.json or {}
-    rk = (d.get("api_key") or "").strip()
-    rs = (d.get("api_secret") or "").strip()
+    rk = (d.get("api_key") or "").strip().replace(" ", "").replace("\n", "").replace("\r", "")
+    rs = (d.get("api_secret") or "").strip().replace(" ", "").replace("\n", "").replace("\r", "")
     with state_lock:
-        if rk:
+        if rk and "Saved" not in rk:
             STATE["api_key"] = rk
-        if rs:
+        if rs and "Saved" not in rs:
             STATE["api_secret"] = rs
         ak = STATE.get("api_key", "")
         asec = STATE.get("api_secret", "")
@@ -751,15 +804,22 @@ def api_sync_keys():
 
 
 # =============================================================================
-# BEARSKIMMER v1.0 CRIMSON SHORT TERMINAL UI
+# BEARSKIMMER v1.2 UI (WITH PWA INSTALL BUTTON & CLEAR PNL BADGES)
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BearSkimmer v1.0 | Autonomous 1x Short Skimmer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#ff2a5f" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="BearSkimmer" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/icon.svg" />
+  <title>BearSkimmer v1.2 | Inverse Short Engine</title>
   <style>
     :root {
       --bg: #07040a;
@@ -782,12 +842,14 @@ HTML_UI = """
       box-shadow: 0 12px 32px rgba(0,0,0,0.6);
     }
     .header-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
-    .logo { font-size: 1.55rem; font-weight: 900; display: flex; align-items: center; gap: 10px; }
+    .logo { font-size: 1.5rem; font-weight: 900; display: flex; align-items: center; gap: 10px; }
     .badge { background: linear-gradient(135deg, var(--crimson), #ff6b35); color: #fff; font-size: 0.72rem; font-weight: 900; padding: 3px 10px; border-radius: 99px; }
-    .sub { color: var(--muted); font-size: 0.79rem; margin-top: 4px; }
+    .sub { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
 
     .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
-    .btn { cursor: pointer; border: none; border-radius: 10px; padding: 9px 14px; font-weight: 800; font-size: 0.78rem; }
+    .btn { cursor: pointer; border: none; border-radius: 10px; padding: 9px 13px; font-weight: 800; font-size: 0.77rem; transition: transform 0.1s ease; }
+    .btn:active { transform: scale(0.97); }
+    .btn-install { background: linear-gradient(135deg, #00f5a0, #00d9f5); color: #022c22; box-shadow: 0 0 16px rgba(0, 245, 160, 0.35); }
     .btn-crimson { background: linear-gradient(135deg, var(--crimson), #e11d48); color: #fff; }
     .btn-neon { background: linear-gradient(135deg, var(--neon), var(--cyan)); color: #022c22; }
     .btn-amber { background: linear-gradient(135deg, #f59e0b, #d97706); color: #1e1b4b; }
@@ -798,6 +860,12 @@ HTML_UI = """
       margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.08);
       font-size: 0.78rem; color: var(--muted); gap: 10px;
     }
+
+    .api-card {
+      background: linear-gradient(135deg, rgba(22, 11, 30, 0.96), rgba(38, 12, 32, 0.88));
+      border: 1px solid #4a1d3d; border-radius: 14px; padding: 13px 16px; margin-bottom: 14px;
+    }
+    .api-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; align-items: end; margin-top: 8px; }
 
     .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(225px, 1fr)); gap: 12px; margin-bottom: 14px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 15px 16px; }
@@ -816,13 +884,18 @@ HTML_UI = """
     th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid #24142e; font-variant-numeric: tabular-nums; }
     th { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; }
 
-    .score-pill { padding: 3px 8px; border-radius: 6px; font-weight: 900; font-size: 0.73rem; }
+    .score-pill { padding: 3px 8px; border-radius: 6px; font-weight: 900; font-size: 0.72rem; }
     .sc-bear { background: rgba(255, 42, 95, 0.22); color: #fda4af; border: 1px solid var(--crimson); }
     .sc-mid { background: rgba(245, 158, 11, 0.16); color: var(--amber); }
 
     .pos-card {
       background: linear-gradient(180deg, rgba(32, 14, 38, 0.95), rgba(15, 8, 20, 0.95));
       border: 1px solid #4a1d3d; border-radius: 12px; padding: 12px 14px; margin-bottom: 10px;
+    }
+    .dual-badges {
+      display: flex; flex-wrap: wrap; gap: 8px; margin: 7px 0; padding: 7px 9px;
+      background: rgba(7, 4, 10, 0.65); border-radius: 8px; border: 1px solid #2e1d3a; font-size: 0.74rem;
+      justify-content: space-between;
     }
     .input-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 10px; }
     label { display: block; font-size: 0.71rem; color: var(--muted); margin-bottom: 4px; font-weight: 700; }
@@ -835,20 +908,41 @@ HTML_UI = """
   <div class="header">
     <div class="header-top">
       <div>
-        <div class="logo">🩸 BEARSKIMMER <span class="badge">v1.0 INVERSE SHORT ENGINE</span></div>
-        <div class="sub">Profits When Coins Drop • 1x Perpetual Futures Short Skimmer • Inverted Trailing Waterfall Lock</div>
+        <div class="logo">🩸 BEARSKIMMER <span class="badge">v1.2 MOBILE APP + TOP-SNIPER</span></div>
+        <div class="sub">Shorts Top-of-Bounce Rejections • Clear Coin Move vs. Short PnL • 1-Tap Phone Install</div>
       </div>
       <div class="btn-row">
+        <button class="btn btn-install" onclick="installPhoneApp()" id="installBtn">📲 Install Phone App</button>
         <button class="btn btn-crimson" onclick="toggleAutoPilot()" id="apBtn">🤖 Bear Auto-Pilot: ON</button>
         <button class="btn btn-amber" onclick="toggleMode()" id="modeBtn">🔀 Mode: PAPER ($100 SIM)</button>
-        <button class="btn btn-outline" onclick="resetPaper()">🔄 Reset $100 Paper Lab</button>
-        <button class="btn btn-outline" onclick="manualScan()">⚡ Sweep Red Market</button>
+        <button class="btn btn-outline" onclick="resetPaper()">🔄 Reset $100 Lab</button>
+        <button class="btn btn-outline" onclick="manualScan()">⚡ Sweep Now</button>
       </div>
     </div>
     <div class="strip">
       <div id="apiStatus" style="font-weight:800; color:var(--neon);">● Paper Mode Active ($100 Virtual Short Bankroll)</div>
-      <div>Rule: <strong>Short High → Wait for -1.12% Price Drop → Cover Low & Bank +1.00% Cash</strong></div>
+      <div>Rule: <strong>Short Bounce Top → Wait for -1.12% Price Drop → Cover Low & Bank +1.00% Cash</strong></div>
       <div>Last Sweep: <strong id="lastUpdate">--:--:--</strong> (<strong class="c-crimson" id="scanMs">0</strong>ms | Cycle #<span id="cycleNum">0</span>)</div>
+    </div>
+  </div>
+
+  <div class="api-card">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+      <div class="sec-title" style="margin-bottom:0;">🔑 Gate.io v4 Futures API Sync (Optional for Live Mode)</div>
+      <div id="apiRight" style="font-size:0.75rem; font-weight:800; color:var(--amber);">Requires Perpetual Futures (Read & Write) enabled on Gate.io Key</div>
+    </div>
+    <div class="api-grid">
+      <div>
+        <label>Gate.io v4 API Key</label>
+        <input type="password" id="apiKeyInput" placeholder="Paste Gate.io API Key..." autocomplete="off" />
+      </div>
+      <div>
+        <label>Gate.io v4 API Secret</label>
+        <input type="password" id="apiSecretInput" placeholder="Paste Gate.io API Secret..." autocomplete="off" />
+      </div>
+      <div>
+        <button class="btn btn-neon" style="width:100%; padding:10px;" onclick="syncApiKeys()" id="syncBtn">🔗 Sync Gate.io Futures Keys</button>
+      </div>
     </div>
   </div>
 
@@ -869,17 +963,17 @@ HTML_UI = """
       <div class="sub">Red-Candle Skims Won: <strong id="skimCount">0</strong></div>
     </div>
     <div class="card">
-      <div class="lbl">Gate.io Futures Fee Advantage</div>
-      <div class="val c-cyan">-1.12% Drop</div>
-      <div class="sub">Needed for <strong>+1.00% Net Profit</strong> (0.12% Fee)</div>
+      <div class="lbl">Target Price Drop Needed</div>
+      <div class="val c-cyan" id="dropNeededBox">-1.12% Drop</div>
+      <div class="sub">Includes 0.12% Gate.io Futures Fee</div>
     </div>
   </div>
 
   <div class="grid-main">
     <div class="card">
       <div class="sec-title">
-        <span>📡 16-Market Bearish Breakdown Radar (Live Futures)</span>
-        <span style="font-size:0.7rem;color:var(--muted);">Score >= 68 Triggers Auto-Short</span>
+        <span>📡 16-Market Bearish Rejection Radar (Live Futures)</span>
+        <span style="font-size:0.7rem;color:var(--muted);">Blocks RSI &lt; 36 Bottoms</span>
       </div>
       <div style="overflow-x:auto;">
         <table>
@@ -901,7 +995,7 @@ HTML_UI = """
 
     <div>
       <div class="card" style="margin-bottom:14px;">
-        <div class="sec-title">🩸 Active 1x Short Positions (Win When Price Falls)</div>
+        <div class="sec-title">🩸 Active 1x Short Positions (Win When Price Falls ↓)</div>
         <div id="positionsBox"></div>
       </div>
 
@@ -943,7 +1037,7 @@ HTML_UI = """
             <tr>
               <th>Time</th>
               <th>Contract</th>
-              <th>Dump %</th>
+              <th>Price Drop</th>
               <th>Short Entry → Covered Low</th>
               <th>Profit</th>
             </tr>
@@ -956,12 +1050,66 @@ HTML_UI = """
 </div>
 
 <script>
+  // Register Service Worker & Capture Install Prompt for Phone App Installation
+  let deferredInstallPrompt = null;
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
+  }
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    const btn = document.getElementById('installBtn');
+    if (btn) btn.innerText = '📲 Install App Now';
+  });
+
+  async function installPhoneApp() {
+    if (deferredInstallPrompt) {
+      deferredInstallPrompt.prompt();
+      const { outcome } = await deferredInstallPrompt.userChoice;
+      if (outcome === 'accepted') {
+        document.getElementById('installBtn').innerText = '✅ App Installed';
+      }
+      deferredInstallPrompt = null;
+    } else {
+      alert(
+        "📲 To finish installing BearSkimmer on your phone:\\n\\n" +
+        "• On Android (Chrome): Tap the 3 dots (⋮) at the top right and tap 'Install app' or 'Add to Home screen'.\\n" +
+        "• On iPhone (Safari): Tap the Share icon (⬆️) at the bottom and tap 'Add to Home Screen'."
+      );
+    }
+  }
+
   function fmtPx(val) {
     const v = Number(val || 0);
     if (v === 0) return '$0.0000';
     if (v < 0.0001) return '$' + v.toFixed(8);
     if (v < 0.01) return '$' + v.toFixed(6);
     return '$' + v.toFixed(4);
+  }
+
+  async function syncApiKeys() {
+    const btn = document.getElementById('syncBtn');
+    const k = document.getElementById('apiKeyInput').value.trim();
+    const s = document.getElementById('apiSecretInput').value.trim();
+    btn.innerText = 'Verifying...';
+    const r = await fetch('/api/sync_keys', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ api_key: k, api_secret: s })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('apiKeyInput').value = '';
+      document.getElementById('apiSecretInput').value = '';
+      btn.innerText = '✅ Connected ($' + Number(d.usdt_balance).toFixed(2) + ' USDT)';
+    } else {
+      alert('API Notice: ' + (d.error || 'Check keys'));
+      btn.innerText = '❌ Sync Failed';
+    }
+    await refresh();
+    setTimeout(() => { btn.innerText = '🔗 Sync Gate.io Futures Keys'; }, 2500);
   }
 
   async function toggleAutoPilot() {
@@ -1036,12 +1184,17 @@ HTML_UI = """
       document.getElementById('scanMs').innerText = s.last_scan_ms;
       document.getElementById('cycleNum').innerText = s.cycle_count;
 
+      const needDrop = (Number(s.skim_profit_pct || 1.0) + Number(s.futures_fee_buffer_pct || 0.12)).toFixed(2);
+      document.getElementById('dropNeededBox').innerText = '-' + needDrop + '% Drop';
+
       const apBtn = document.getElementById('apBtn');
       apBtn.innerText = s.auto_pilot ? '🤖 Bear Auto-Pilot: ON' : '✋ Bear Auto-Pilot: MANUAL';
 
       const modeBtn = document.getElementById('modeBtn');
       modeBtn.innerText = s.mode === 'LIVE' ? '🔀 Mode: LIVE FUTURES' : '🔀 Mode: PAPER ($100 SIM)';
       modeBtn.className = s.mode === 'LIVE' ? 'btn btn-neon' : 'btn btn-amber';
+
+      document.getElementById('apiStatus').innerText = '● ' + (s.api_status_msg || '');
 
       const posMap = s.short_positions || {};
       const posKeys = Object.keys(posMap);
@@ -1080,21 +1233,32 @@ HTML_UI = """
 
       const pBox = document.getElementById('positionsBox');
       if (posKeys.length === 0) {
-        pBox.innerHTML = `<div style="color:#71717a;text-align:center;padding:18px;font-size:0.8rem;">Scanning for Bear Score >= ${s.min_bear_score} to open 1x Shorts...</div>`;
+        pBox.innerHTML = `<div style="color:#71717a;text-align:center;padding:18px;font-size:0.8rem;">Scanning for Top-of-Bounce Bear Score >= ${s.min_bear_score} to open 1x Shorts...</div>`;
       } else {
         pBox.innerHTML = posKeys.map(k => {
           const p = posMap[k];
-          const pnlSign = p.pnl_pct >= 0 ? '+' : '';
+          const coinMove = Number(p.coin_move_pct || 0);
+          const coinArrow = coinMove <= 0 ? '↓' : '↑';
+          const coinSign = coinMove > 0 ? '+' : '';
+          const pnl = Number(p.pnl_pct || 0);
+          const pnlSign = pnl >= 0 ? '+' : '';
+          const pnlUsdt = Number(p.pnl_usdt || 0);
+          const pnlUsdtSign = pnlUsdt >= 0 ? '+' : '';
+
           return `
             <div class="pos-card">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
                 <div><strong>${p.pair}</strong> <span class="score-pill sc-bear">1x SHORT ($${Number(p.margin_usdt).toFixed(2)})</span></div>
-                <div style="font-weight:900;color:${p.pnl_pct >= 0 ? '#00f5a0' : '#f59e0b'}">
-                  Now: ${fmtPx(p.last_price)} (${pnlSign}${p.pnl_pct}% Profit)
-                </div>
+                <div style="font-weight:900;font-size:0.86rem;">Live: ${fmtPx(p.last_price)}</div>
               </div>
+
+              <div class="dual-badges">
+                <span>Coin Move: <strong style="color:${coinMove <= 0 ? '#00f5a0' : '#f59e0b'}">${coinSign}${coinMove.toFixed(2)}% ${coinArrow}</strong></span>
+                <span>Short Net PnL: <strong style="color:${pnl >= 0 ? '#00f5a0' : '#f59e0b'}">${pnlSign}${pnl.toFixed(2)}% (${pnlUsdtSign}$${pnlUsdt.toFixed(3)})</strong></span>
+              </div>
+
               <div style="font-size:0.74rem;color:#a1a1aa;display:flex;justify-content:space-between;margin-bottom:6px;">
-                <span>Shorted High @ <strong>${fmtPx(p.entry_price)}</strong></span>
+                <span>Shorted @ <strong>${fmtPx(p.entry_price)}</strong></span>
                 <span>Buyback Target @ <strong class="c-neon">${fmtPx(p.target_buyback_price)}</strong></span>
                 <button onclick="closeSlot('${p.pair}')" style="background:none;border:none;color:#ff2a5f;cursor:pointer;font-weight:800;font-size:0.7rem;">✖ Close</button>
               </div>
@@ -1116,7 +1280,7 @@ HTML_UI = """
           </tr>
         `).join('');
       } else {
-        lb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#71717a;padding:16px;">Waiting for first -1.12% red-candle dump to skim profit...</td></tr>`;
+        lb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#71717a;padding:16px;">Waiting for first -${needDrop}% price drop to bank cash...</td></tr>`;
       }
 
       document.getElementById('logBox').innerHTML = (s.logs || []).join('<br/>');
