@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "bearskimmer_v3_0_state.json"
+STATE_FILE = "bearskimmer_v3_2_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -49,9 +49,9 @@ DEFAULT_STATE = {
     "mode": "PAPER",
     "auto_pilot": True,
     "max_short_slots": 5,
-    "slot_size_usdt": 10.0,
-    "step_up_trigger_pct": 2.0,
-    "step_up_size_usdt": 5.0,
+    "slot_size_usdt": 100.0,
+    "step_up_trigger_pct": 2.0,     # When coin pumps +2.0% above last entry
+    "step_up_scale_pct": 50.0,      # Adds 50% of the coin's initial investment ($50 on a $100 short, $5 on a $10 short!)
     "max_step_ups": 2,
     "min_bear_score": 68,
     "skim_profit_pct": 1.00,
@@ -62,9 +62,10 @@ DEFAULT_STATE = {
     "api_connected": False,
     "api_status_msg": "Not Connected — Paste Gate.io Keys Below for Live Mode",
     "live_futures_usdt": 0.0,
-    "paper_usdt_balance": 100.0,
-    "paper_starting_bankroll": 100.0,
+    "paper_usdt_balance": 1000.0,
+    "paper_starting_bankroll": 1000.0,
     "short_positions": {},
+    "blocked_pairs": [],
     "radar": [],
     "stats": {
         "paper_skims": 0,
@@ -94,7 +95,12 @@ def add_log(msg):
 
 def load_state():
     global STATE
-    for fn in [STATE_FILE, "bearskimmer_v2_0_state.json", "bearskimmer_v1_2_state.json", "bearskimmer_v1_state.json"]:
+    for fn in [
+        STATE_FILE,
+        "bearskimmer_v3_1_state.json",
+        "bearskimmer_v3_0_state.json",
+        "bearskimmer_v2_0_state.json"
+    ]:
         if os.path.exists(fn):
             try:
                 with open(fn, "r") as f:
@@ -107,9 +113,13 @@ def load_state():
                     if ss:
                         STATE["api_secret"] = ss
                     STATE.setdefault("step_up_trigger_pct", 2.0)
-                    STATE.setdefault("step_up_size_usdt", 5.0)
+                    STATE.setdefault("step_up_scale_pct", 50.0)
                     STATE.setdefault("max_step_ups", 2)
-                    STATE.setdefault("paper_starting_bankroll", 100.0)
+                    STATE.setdefault("paper_starting_bankroll", 1000.0)
+                    STATE.setdefault("blocked_pairs", [])
+                    # Backfill base_slot_usdt on existing positions so proportional step-up works immediately
+                    for p in STATE.get("short_positions", {}).values():
+                        p.setdefault("base_slot_usdt", float(p.get("margin_usdt", 100.0)))
                 break
             except Exception as e:
                 add_log(f"State load notice: {e}")
@@ -300,7 +310,7 @@ def place_futures_short_order(contract, size_contracts):
 
 
 # =============================================================================
-# MAIN EXECUTION ENGINE (WITH AUTO-STEP-UP BAR MOVER)
+# MAIN EXECUTION ENGINE (PROPORTIONAL % STEP-UP BAR MOVER)
 # =============================================================================
 def run_bear_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
@@ -312,9 +322,9 @@ def run_bear_cycle(force_manual=False):
             mode = STATE.get("mode", "PAPER")
             auto_pilot = bool(STATE.get("auto_pilot", True))
             max_slots = int(STATE.get("max_short_slots", 5))
-            slot_size = float(STATE.get("slot_size_usdt", 10.0))
+            slot_size = float(STATE.get("slot_size_usdt", 100.0))
             step_trigger_pct = float(STATE.get("step_up_trigger_pct", 2.0))
-            step_add_usdt = float(STATE.get("step_up_size_usdt", 5.0))
+            step_scale_pct = float(STATE.get("step_up_scale_pct", 50.0))
             max_steps = int(STATE.get("max_step_ups", 2))
             min_bear = int(STATE.get("min_bear_score", 68))
             skim_pct = float(STATE.get("skim_profit_pct", 1.00))
@@ -322,6 +332,7 @@ def run_bear_cycle(force_manual=False):
             fee_buf = float(STATE.get("futures_fee_buffer_pct", 0.12))
             has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
             active_pairs = list(STATE["short_positions"].keys())
+            blocked_set = set(STATE.get("blocked_pairs", []))
 
         if has_keys:
             try:
@@ -345,34 +356,43 @@ def run_bear_cycle(force_manual=False):
         for pair in BEAR_UNIVERSE:
             tk = tk_map.get(pair)
             if tk:
-                radar_list.append(compute_bear_score(pair, tk))
+                r_item = compute_bear_score(pair, tk).copy()
+                r_item["is_blocked"] = (pair in blocked_set)
+                radar_list.append(r_item)
         radar_list.sort(key=lambda x: x["bear_score"], reverse=True)
 
         required_drop_pct = skim_pct + fee_buf
 
         for pair in list(STATE["short_positions"].keys()):
-            pos = STATE["short_positions"].get(pair)
+            with state_lock:
+                pos = STATE["short_positions"].get(pair)
             if not pos or pair not in tk_map:
                 continue
 
             live_px = tk_map[pair]["last"]
             entry_px = float(pos["entry_price"])
             margin_usdt = float(pos["margin_usdt"])
+            base_slot = float(pos.get("base_slot_usdt") or margin_usdt)
             steps_done = int(pos.get("step_ups_done", 0))
             last_step_px = float(pos.get("last_step_price") or entry_px)
 
-            # AUTO-STEP-UP BAR MOVER WHEN COIN PUMPS +2.0%
+            # PROPORTIONAL STEP-UP AMOUNT (e.g. 50% of $100 slot = $50 top-up; 50% of $10 slot = $5 top-up!)
+            dynamic_step_add_usdt = round(max(2.0, base_slot * (step_scale_pct / 100.0)), 2)
+            pos["next_step_add_usdt"] = dynamic_step_add_usdt
+
             pump_from_last_pct = ((live_px - last_step_px) / last_step_px) * 100.0
             if steps_done < max_steps and pump_from_last_pct >= step_trigger_pct:
-                if mode == "PAPER" and STATE.get("paper_usdt_balance", 0.0) >= step_add_usdt:
+                if mode == "PAPER" and STATE.get("paper_usdt_balance", 0.0) >= dynamic_step_add_usdt:
                     with state_lock:
+                        if pair not in STATE["short_positions"]:
+                            continue
                         old_entry = entry_px
                         old_units = margin_usdt / entry_px
-                        add_units = step_add_usdt / live_px
-                        new_margin = round(margin_usdt + step_add_usdt, 4)
+                        add_units = dynamic_step_add_usdt / live_px
+                        new_margin = round(margin_usdt + dynamic_step_add_usdt, 4)
                         new_avg_entry = new_margin / (old_units + add_units)
 
-                        STATE["paper_usdt_balance"] = round(STATE["paper_usdt_balance"] - step_add_usdt, 4)
+                        STATE["paper_usdt_balance"] = round(STATE["paper_usdt_balance"] - dynamic_step_add_usdt, 4)
                         pos["margin_usdt"] = new_margin
                         pos["entry_price"] = new_avg_entry
                         pos["last_step_price"] = live_px
@@ -382,14 +402,14 @@ def run_bear_cycle(force_manual=False):
                         margin_usdt = new_margin
                         new_target = entry_px * (1.0 - (required_drop_pct / 100.0))
                         add_log(
-                            f"🔼 [AUTO BAR RAISE #{steps_done+1}][{pair}] Pumped +{pump_from_last_pct:.1f}% to {fmt_px(live_px)}! "
-                            f"Added ${step_add_usdt:.0f} -> Entry Bar raised {fmt_px(old_entry)} → {fmt_px(entry_px)} "
-                            f"(New Target: {fmt_px(new_target)})"
+                            f"🔼 [PROPORTIONAL BAR RAISE #{steps_done+1}][{pair}] Pumped +{pump_from_last_pct:.1f}% to {fmt_px(live_px)}! "
+                            f"Added ${dynamic_step_add_usdt:.0f} ({step_scale_pct:.0f}% of ${base_slot:.0f}) -> "
+                            f"Entry Bar raised {fmt_px(old_entry)} → {fmt_px(entry_px)} (New Target: {fmt_px(new_target)})"
                         )
-                elif mode == "LIVE" and has_keys and STATE.get("live_futures_usdt", 0.0) >= step_add_usdt:
+                elif mode == "LIVE" and has_keys and STATE.get("live_futures_usdt", 0.0) >= dynamic_step_add_usdt:
                     meta = get_contract_meta(pair)
                     c_val = live_px * meta["quanto_multiplier"]
-                    add_contracts = max(1, int(step_add_usdt / max(1e-9, c_val)))
+                    add_contracts = max(1, int(dynamic_step_add_usdt / max(1e-9, c_val)))
                     actual_add_usdt = round(add_contracts * c_val, 4)
                     code, _ = place_futures_short_order(pair, -add_contracts)
                     if code in (200, 201):
@@ -451,8 +471,8 @@ def run_bear_cycle(force_manual=False):
                     next_step_px = last_step_px * (1.0 + (step_trigger_pct / 100.0))
                     if int(pos.get("step_ups_done", 0)) < max_steps:
                         pos["status"] = (
-                            f"Need -{need_drop:.2f}% drop to target | "
-                            f"Auto-Raises Bar if price hits {fmt_px(next_step_px)}"
+                            f"Need -{need_drop:.2f}% drop | "
+                            f"Adds +${dynamic_step_add_usdt:.0f} ({step_scale_pct:.0f}%) if price hits {fmt_px(next_step_px)}"
                         )
                     else:
                         pos["status"] = f"Bar Raised {pos.get('step_ups_done')}x (Max) — Waiting for -{need_drop:.2f}% drop"
@@ -461,6 +481,8 @@ def run_bear_cycle(force_manual=False):
                 profit_usdt = max(0.01, round(margin_usdt * (max(skim_pct, net_pnl_pct) / 100.0), 4))
                 if mode == "PAPER":
                     with state_lock:
+                        if pair not in STATE["short_positions"]:
+                            continue
                         STATE["paper_usdt_balance"] = round(
                             STATE.get("paper_usdt_balance", 0.0) + margin_usdt + profit_usdt, 4
                         )
@@ -476,7 +498,8 @@ def run_bear_cycle(force_manual=False):
                             "profit": f"+${profit_usdt:.4f}"
                         })
                         add_log(
-                            f"🩸💎 [BEAR SKIM WON][{pair}] Covered @ {fmt_px(live_px)} | Banked +${profit_usdt:.4f}!"
+                            f"🩸💎 [BEAR SKIM WON][{pair}] Covered ${margin_usdt:.0f} Short @ {fmt_px(live_px)} | "
+                            f"Banked +${profit_usdt:.4f}!"
                         )
                         STATE["short_positions"].pop(pair, None)
                 elif mode == "LIVE" and has_keys:
@@ -501,32 +524,46 @@ def run_bear_cycle(force_manual=False):
                             )
                             STATE["short_positions"].pop(pair, None)
 
-        # 3) OPEN NEW AUTONOMOUS SHORTS
-        if auto_pilot and len(STATE["short_positions"]) < max_slots:
+        # 3) OPEN NEW AUTONOMOUS SHORTS (SKIPS BLOCKED COINS)
+        with state_lock:
+            current_ap = bool(STATE.get("auto_pilot", True))
+            current_open_cnt = len(STATE["short_positions"])
+
+        if current_ap and current_open_cnt < max_slots:
             for cand in radar_list:
                 with state_lock:
+                    if not STATE.get("auto_pilot", True):
+                        break
                     if len(STATE["short_positions"]) >= max_slots:
                         break
                     c_pair = cand["pair"]
-                    if c_pair in STATE["short_positions"]:
+                    if c_pair in STATE["short_positions"] or c_pair in STATE.get("blocked_pairs", []):
                         continue
                 if cand["bear_score"] < min_bear:
                     break
 
                 c_price = cand["price"]
                 target_px = c_price * (1.0 - (required_drop_pct / 100.0))
+                step_add_preview = round(max(2.0, slot_size * (step_scale_pct / 100.0)), 2)
 
                 if mode == "PAPER":
                     with state_lock:
-                        if len(STATE["short_positions"]) >= max_slots or c_pair in STATE["short_positions"]:
+                        if (
+                            not STATE.get("auto_pilot", True)
+                            or len(STATE["short_positions"]) >= max_slots
+                            or c_pair in STATE["short_positions"]
+                            or c_pair in STATE.get("blocked_pairs", [])
+                        ):
                             continue
-                        avail = float(STATE.get("paper_usdt_balance", 100.0))
+                        avail = float(STATE.get("paper_usdt_balance", 1000.0))
                         if avail < slot_size:
                             break
                         STATE["paper_usdt_balance"] = round(avail - slot_size, 4)
                         STATE["short_positions"][c_pair] = {
                             "pair": c_pair,
+                            "base_slot_usdt": slot_size,
                             "margin_usdt": slot_size,
+                            "next_step_add_usdt": step_add_preview,
                             "current_equity_usdt": slot_size,
                             "entry_price": c_price,
                             "last_step_price": c_price,
@@ -541,8 +578,14 @@ def run_bear_cycle(force_manual=False):
                             "lowest_price": c_price,
                             "status": f"1x Short Opened (Score {cand['bear_score']}/100)"
                         }
-                        add_log(f"🩸 [AUTO-SHORT][{c_pair}] ${slot_size:.0f} @ {fmt_px(c_price)} (Target: {fmt_px(target_px)})")
+                        add_log(
+                            f"🩸 [AUTO-SHORT][{c_pair}] ${slot_size:.0f} @ {fmt_px(c_price)} "
+                            f"(Target: {fmt_px(target_px)} | Step-Up: +${step_add_preview:.0f})"
+                        )
                 elif mode == "LIVE" and has_keys:
+                    with state_lock:
+                        if c_pair in STATE.get("blocked_pairs", []):
+                            continue
                     avail_fut = float(STATE.get("live_futures_usdt", 0.0))
                     if avail_fut < slot_size:
                         break
@@ -557,7 +600,9 @@ def run_bear_cycle(force_manual=False):
                             STATE["short_positions"][c_pair] = {
                                 "pair": c_pair,
                                 "contracts": num_contracts,
+                                "base_slot_usdt": actual_notional,
                                 "margin_usdt": actual_notional,
+                                "next_step_add_usdt": round(actual_notional * (step_scale_pct / 100.0), 2),
                                 "current_equity_usdt": actual_notional,
                                 "entry_price": c_price,
                                 "last_step_price": c_price,
@@ -575,6 +620,9 @@ def run_bear_cycle(force_manual=False):
                             add_log(f"🩸 [LIVE SHORT][{c_pair}] ${actual_notional:.2f} @ {fmt_px(c_price)}")
 
         with state_lock:
+            b_set = set(STATE.get("blocked_pairs", []))
+            for item in radar_list:
+                item["is_blocked"] = (item["pair"] in b_set)
             STATE["radar"] = radar_list[:12]
             STATE["skim_ledger"] = STATE["skim_ledger"][:50]
             STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
@@ -589,7 +637,7 @@ def run_bear_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("🩸 BearSkimmer v3.0 PRO Online — Institutional Terminal + Auto-Step-Up Bar Mover Active.")
+    add_log("🩸 BearSkimmer v3.2 PRO Online — Proportional % Step-Up Bar Mover + Closed-Coin Blocker Active.")
     while True:
         run_bear_cycle(force_manual=False)
         time.sleep(3.5)
@@ -615,7 +663,7 @@ def check_worker():
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
-        "name": "BearSkimmer v3.0 PRO",
+        "name": "BearSkimmer v3.2 PRO",
         "short_name": "BearSkimmer",
         "start_url": "/",
         "display": "standalone",
@@ -642,7 +690,7 @@ def pwa_sw():
 
 
 # =============================================================================
-# API ENDPOINTS (CUSTOM SHORT, RESET USDT, SYNC KEYS, CONFIG, STEP-UP)
+# API ENDPOINTS
 # =============================================================================
 @app.route("/api/state")
 def api_state():
@@ -665,7 +713,7 @@ def api_scan_now():
 def api_toggle_autopilot():
     with state_lock:
         STATE["auto_pilot"] = not bool(STATE.get("auto_pilot", True))
-        add_log(f"🤖 Bear Auto-Pilot switched to: {'ON' if STATE['auto_pilot'] else 'MANUAL'}")
+        add_log(f"🤖 Bear Auto-Pilot switched to: {'ON' if STATE['auto_pilot'] else 'MANUAL (PAUSED)'}")
         save_state()
     return jsonify({"ok": True})
 
@@ -682,28 +730,30 @@ def api_toggle_mode():
 
 @app.route("/api/reset_usdt_balance", methods=["POST"])
 def api_reset_usdt_balance():
-    """Resets Paper USDT balance to user-specified amount (default $100) and clears stuck paper positions."""
     d = request.json or {}
-    raw_amt = d.get("amount_usdt", 100.0)
+    raw_amt = d.get("amount_usdt", 1000.0)
     keep_profits = bool(d.get("keep_profits", False))
     try:
         new_bal = max(10.0, float(raw_amt))
     except Exception:
-        new_bal = 100.0
+        new_bal = 1000.0
 
     with state_lock:
         STATE["paper_usdt_balance"] = round(new_bal, 4)
         STATE["paper_starting_bankroll"] = round(new_bal, 4)
         STATE["short_positions"] = {}
         if not keep_profits:
+            STATE["blocked_pairs"] = []
             STATE["stats"]["paper_skims"] = 0
             STATE["stats"]["paper_profit_usdt"] = 0.0
             STATE["skim_ledger"] = []
-            add_log(f"💰 Reset Paper Bankroll to ${new_bal:.2f} USDT & cleared Profit Vault!")
+            add_log(f"💰 Full Reset: Paper Bankroll set to ${new_bal:.2f} USDT & cleared all slots/blocks!")
         else:
-            add_log(f"🔄 Reset Paper Bankroll to ${new_bal:.2f} USDT (Kept Profit Vault intact)!")
+            STATE["auto_pilot"] = False
+            add_log(
+                f"♻️ Cleared all active slots, restored ${new_bal:.2f} USDT, and paused Auto-Pilot!"
+            )
         save_state()
-    run_bear_cycle(force_manual=True)
     return jsonify({"ok": True})
 
 
@@ -729,11 +779,13 @@ def api_manual_short():
     pair = raw_pair if "_" in raw_pair else f"{raw_pair}_USDT"
 
     raw_amt = d.get("amount_usdt")
-    custom_size = float(raw_amt) if (raw_amt and float(raw_amt) >= 2.0) else float(STATE.get("slot_size_usdt", 10.0))
+    custom_size = float(raw_amt) if (raw_amt and float(raw_amt) >= 2.0) else float(STATE.get("slot_size_usdt", 100.0))
 
     with state_lock:
         if pair in STATE["short_positions"]:
             return jsonify({"ok": False, "error": f"{pair} is already in your Active Shorts"}), 400
+        if pair in STATE.get("blocked_pairs", []):
+            STATE["blocked_pairs"].remove(pair)
 
     try:
         tk_map = fetch_futures_tickers([pair])
@@ -743,9 +795,11 @@ def api_manual_short():
         fee_buf = float(STATE.get("futures_fee_buffer_pct", 0.12))
         req_drop = float(STATE.get("skim_profit_pct", 1.0)) + fee_buf
         target_px = c_price * (1.0 - (req_drop / 100.0))
+        scale_pct = float(STATE.get("step_up_scale_pct", 50.0))
+        step_add_preview = round(max(2.0, custom_size * (scale_pct / 100.0)), 2)
 
         with state_lock:
-            avail = float(STATE.get("paper_usdt_balance", 100.0))
+            avail = float(STATE.get("paper_usdt_balance", 1000.0))
             if STATE["mode"] == "PAPER" and avail < custom_size:
                 return jsonify({"ok": False, "error": f"Insufficient Free Paper USDT (${avail:.2f})"}), 400
 
@@ -753,7 +807,9 @@ def api_manual_short():
                 STATE["paper_usdt_balance"] = round(avail - custom_size, 4)
                 STATE["short_positions"][pair] = {
                     "pair": pair,
+                    "base_slot_usdt": custom_size,
                     "margin_usdt": custom_size,
+                    "next_step_add_usdt": step_add_preview,
                     "current_equity_usdt": custom_size,
                     "entry_price": c_price,
                     "last_step_price": c_price,
@@ -768,7 +824,10 @@ def api_manual_short():
                     "lowest_price": c_price,
                     "status": "Commanded Custom 1x Short"
                 }
-                add_log(f"⚡ [CUSTOM SHORT][{pair}] Shorted ${custom_size:.2f} @ {fmt_px(c_price)} (Target: {fmt_px(target_px)})")
+                add_log(
+                    f"⚡ [CUSTOM SHORT][{pair}] Shorted ${custom_size:.2f} @ {fmt_px(c_price)} "
+                    f"(Target: {fmt_px(target_px)} | Step-Up: +${step_add_preview:.0f})"
+                )
                 save_state()
                 return jsonify({"ok": True})
             else:
@@ -785,7 +844,9 @@ def api_manual_short():
                     STATE["short_positions"][pair] = {
                         "pair": pair,
                         "contracts": num_c,
+                        "base_slot_usdt": actual_notional,
                         "margin_usdt": actual_notional,
+                        "next_step_add_usdt": round(actual_notional * (scale_pct / 100.0), 2),
                         "current_equity_usdt": actual_notional,
                         "entry_price": c_price,
                         "last_step_price": c_price,
@@ -815,9 +876,16 @@ def api_step_up_now():
         pos = STATE["short_positions"].get(pair)
         if not pos:
             return jsonify({"ok": False, "error": "Position not found"}), 400
-        step_add = float(STATE.get("step_up_size_usdt", 5.0))
+
+        base_slot = float(pos.get("base_slot_usdt") or pos.get("margin_usdt", 100.0))
+        scale_pct = float(STATE.get("step_up_scale_pct", 50.0))
+        step_add = round(max(2.0, base_slot * (scale_pct / 100.0)), 2)
+
         if STATE.get("paper_usdt_balance", 0.0) < step_add:
-            return jsonify({"ok": False, "error": f"Need ${step_add:.2f} in Free USDT Reserve to Raise Bar"}), 400
+            return jsonify({
+                "ok": False,
+                "error": f"Need ${step_add:.2f} ({scale_pct:.0f}% of ${base_slot:.0f}) in Free Step-Up USDT Reserve! Close an extra slot to free up cash."
+            }), 400
 
         live_px = float(pos["last_price"])
         old_entry = float(pos["entry_price"])
@@ -838,7 +906,7 @@ def api_step_up_now():
         pos["step_ups_done"] = int(pos.get("step_ups_done", 0)) + 1
 
         add_log(
-            f"🔼 [MANUAL BAR RAISE][{pair}] Added ${step_add:.0f} @ {fmt_px(live_px)} -> "
+            f"🔼 [MANUAL PROPORTIONAL BAR RAISE][{pair}] Added ${step_add:.0f} ({scale_pct:.0f}%) @ {fmt_px(live_px)} -> "
             f"Entry Bar raised {fmt_px(old_entry)} → {fmt_px(new_entry)} (New Target: {fmt_px(new_target)})"
         )
         save_state()
@@ -851,12 +919,35 @@ def api_close_short_slot():
     pair = (request.json or {}).get("pair", "")
     with state_lock:
         pos = STATE["short_positions"].pop(pair, None)
-        if pos and STATE.get("mode") == "PAPER":
-            STATE["paper_usdt_balance"] = round(
-                STATE.get("paper_usdt_balance", 0.0) + float(pos.get("current_equity_usdt", 0.0)), 4
-            )
-            add_log(f"Closed {pair} short slot & returned ${pos.get('current_equity_usdt', 0.0):.2f} to Free USDT.")
+        if pair and pair not in STATE.get("blocked_pairs", []):
+            STATE.setdefault("blocked_pairs", []).append(pair)
+
+        if pos:
+            if STATE.get("mode") == "PAPER":
+                refund = float(pos.get("current_equity_usdt", pos.get("margin_usdt", 0.0)))
+                STATE["paper_usdt_balance"] = round(STATE.get("paper_usdt_balance", 0.0) + refund, 4)
+                add_log(
+                    f"🛑 Closed {pair} short (Refunded ${refund:.2f} to Free Reserve) & BLOCKED Auto-Pilot from re-buying {pair}!"
+                )
+            elif STATE.get("mode") == "LIVE" and STATE.get("api_key"):
+                contracts = int(pos.get("contracts", 1))
+                place_futures_short_order(pair, abs(contracts))
+                add_log(f"🛑 Closed LIVE {pair} short & BLOCKED Auto-Pilot from re-buying {pair}!")
             save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/unblock_pair", methods=["POST"])
+def api_unblock_pair():
+    pair = (request.json or {}).get("pair", "")
+    with state_lock:
+        if pair == "ALL":
+            STATE["blocked_pairs"] = []
+            add_log("🔓 Unblocked all coins for Auto-Pilot.")
+        elif pair in STATE.get("blocked_pairs", []):
+            STATE["blocked_pairs"].remove(pair)
+            add_log(f"🔓 Unblocked {pair} — Auto-Pilot is allowed to trade it again.")
+        save_state()
     return jsonify({"ok": True})
 
 
@@ -872,13 +963,13 @@ def api_update_config():
             STATE["skim_profit_pct"] = max(0.2, float(d["skim_profit_pct"]))
         if d.get("step_up_trigger_pct"):
             STATE["step_up_trigger_pct"] = max(0.5, float(d["step_up_trigger_pct"]))
-        if d.get("step_up_size_usdt"):
-            STATE["step_up_size_usdt"] = max(1.0, float(d["step_up_size_usdt"]))
+        if d.get("step_up_scale_pct"):
+            STATE["step_up_scale_pct"] = max(10.0, min(200.0, float(d["step_up_scale_pct"])))
         if d.get("min_bear_score"):
             STATE["min_bear_score"] = max(40, min(95, int(d["min_bear_score"])))
         add_log(
             f"⚙️ Saved Engine Parameters: Base=${STATE['slot_size_usdt']:.0f} | Max Slots={STATE['max_short_slots']} | "
-            f"Skim=+{STATE['skim_profit_pct']}% | Step-Up=+{STATE['step_up_trigger_pct']}% (+${STATE['step_up_size_usdt']:.0f})"
+            f"Skim=+{STATE['skim_profit_pct']}% | Step-Up=+{STATE['step_up_trigger_pct']}% (Adds {STATE['step_up_scale_pct']:.0f}% of Slot)"
         )
         save_state()
     run_bear_cycle(force_manual=True)
@@ -913,7 +1004,7 @@ def api_sync_keys():
 
 
 # =============================================================================
-# PEAK INSTITUTIONAL UI — BEARSKIMMER v3.0 PRO
+# PEAK INSTITUTIONAL UI — BEARSKIMMER v3.2 PRO
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -924,7 +1015,7 @@ HTML_UI = """
   <meta name="theme-color" content="#ff2a5f" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/icon.svg" />
-  <title>BearSkimmer v3.0 PRO | Institutional Short Engine</title>
+  <title>BearSkimmer v3.2 PRO | Proportional Step-Up Short Engine</title>
   <style>
     :root {
       --bg: #060309;
@@ -945,7 +1036,6 @@ HTML_UI = """
     }
     .wrap { max-width: 1240px; margin: 0 auto; }
 
-    /* HERO HEADER */
     .hero {
       background: linear-gradient(135deg, rgba(255, 42, 95, 0.16), rgba(168, 85, 247, 0.12));
       border: 1px solid rgba(255, 42, 95, 0.45); border-radius: 18px; padding: 16px 20px; margin-bottom: 14px;
@@ -970,7 +1060,6 @@ HTML_UI = """
       font-size: 0.77rem; color: var(--muted); gap: 10px;
     }
 
-    /* API KEY & BANKROLL BAR */
     .top-panels { display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; margin-bottom: 14px; }
     @media (max-width: 920px) { .top-panels { grid-template-columns: 1fr; } }
 
@@ -982,7 +1071,6 @@ HTML_UI = """
     .api-grid { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: end; }
     @media (max-width: 640px) { .api-grid { grid-template-columns: 1fr; } }
 
-    /* 4 SCOREBOARD CARDS */
     .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(225px, 1fr)); gap: 12px; margin-bottom: 14px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 15px; padding: 15px 16px; }
     .lbl { font-size: 0.7rem; font-weight: 800; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
@@ -992,7 +1080,6 @@ HTML_UI = """
     .c-cyan { color: var(--cyan); }
     .c-amber { color: var(--amber); }
 
-    /* MAIN 2-COLUMN WORKSPACE */
     .grid-main { display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px; margin-bottom: 14px; }
     @media (max-width: 960px) { .grid-main { grid-template-columns: 1fr; } }
 
@@ -1019,7 +1106,16 @@ HTML_UI = """
       padding: 5px 10px; border-radius: 8px; font-size: 0.72rem; font-weight: 800; cursor: pointer;
     }
 
-    /* COMMAND & SETTINGS INPUTS */
+    .blocked-bar {
+      background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.4);
+      border-radius: 10px; padding: 8px 12px; margin-bottom: 10px; font-size: 0.74rem;
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px;
+    }
+    .unblock-chip {
+      background: rgba(255,255,255,0.08); border: 1px solid var(--amber); color: #fde68a;
+      padding: 3px 8px; border-radius: 6px; font-size: 0.68rem; font-weight: 800; cursor: pointer;
+    }
+
     .chip-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
     .chip { background: #1c1026; border: 1px solid #3c204f; color: #e4e4e7; font-size: 0.7rem; font-weight: 800; padding: 5px 10px; border-radius: 99px; cursor: pointer; }
     .chip:hover { border-color: var(--crimson); color: #fff; }
@@ -1042,8 +1138,8 @@ HTML_UI = """
   <div class="hero">
     <div class="hero-top">
       <div>
-        <div class="logo">🩸 BEARSKIMMER <span class="badge">v3.0 PRO TERMINAL</span></div>
-        <div class="sub">Autonomous 1x Short Skimmer • Auto-Step-Up Bar Mover (+2% Pump Rescuer) • Custom Trade & Bankroll Control</div>
+        <div class="logo">🩸 BEARSKIMMER <span class="badge">v3.2 PROPORTIONAL STEP-UP</span></div>
+        <div class="sub">Proportional % Bar-Raising Engine • Closed-Coin Auto-Block Protection • 1-Tap Phone App</div>
       </div>
       <div class="btn-row">
         <button class="btn btn-install" onclick="installApp()" id="installBtn">📲 Install Phone App</button>
@@ -1054,7 +1150,7 @@ HTML_UI = """
     </div>
     <div class="strip">
       <div id="apiStatus" style="font-weight:800; color:var(--neon);">● Paper Simulation Active</div>
-      <div>Auto-Step-Up Rule: <strong>Coin Pumps +<span id="ruleTrig">2.0</span>% → Adds $<span id="ruleAdd">5</span> Short to Raise Entry & Target Bar Higher</strong></div>
+      <div>Proportional Step-Up: <strong>Coin Pumps +<span id="ruleTrig">2.0</span>% → Adds <span id="ruleScale">50</span>% of Slot Size (e.g. +$50 on $100) to Raise Bar!</strong></div>
       <div>Last Sweep: <strong id="lastUpdate">--:--:--</strong> (<strong class="c-crimson" id="scanMs">0</strong>ms | Cycle #<span id="cycleNum">0</span>)</div>
     </div>
   </div>
@@ -1087,10 +1183,10 @@ HTML_UI = """
       <div style="display:grid; grid-template-columns: 1fr auto auto; gap:8px; align-items:end;">
         <div>
           <label>Starting Paper USDT Balance ($)</label>
-          <input type="number" id="resetUsdtInput" step="10" value="100" placeholder="e.g. 100" />
+          <input type="number" id="resetUsdtInput" step="50" value="1000" placeholder="e.g. 1000" />
         </div>
         <button class="btn btn-crimson" style="height:38px;" onclick="resetUsdtBalance(false)">🔄 Full Reset</button>
-        <button class="btn btn-outline" style="height:38px;" onclick="resetUsdtBalance(true)">♻️ Free Slots Only</button>
+        <button class="btn btn-outline" style="height:38px;" onclick="resetUsdtBalance(true)">♻️ Clear & Pause Auto</button>
       </div>
     </div>
   </div>
@@ -1104,8 +1200,8 @@ HTML_UI = """
     </div>
     <div class="card">
       <div class="lbl">Total Portfolio (Shorts + Free Cash)</div>
-      <div class="val c-cyan" id="totalPort">$100.0000</div>
-      <div class="sub">Free Step-Up USDT Reserve: <strong id="freeUsdt" class="c-neon">$100.00</strong></div>
+      <div class="val c-cyan" id="totalPort">$1000.0000</div>
+      <div class="sub">Free Step-Up USDT Reserve: <strong id="freeUsdt" class="c-neon">$500.00</strong></div>
     </div>
     <div class="card">
       <div class="lbl">Bear Skim Profit Vault</div>
@@ -1113,19 +1209,20 @@ HTML_UI = """
       <div class="sub">Completed Red-Candle Wins: <strong id="skimCount">0</strong></div>
     </div>
     <div class="card">
-      <div class="lbl">Target Drop & Step-Up Bar</div>
+      <div class="lbl">Target Drop & Step-Up Scale</div>
       <div class="val c-amber" id="dropNeededBox">-1.12% Drop</div>
-      <div class="sub">Auto-Raises Bar on <strong>+<span id="cardTrig">2.0</span>% Pump</strong></div>
+      <div class="sub">+<span id="cardTrig">2.0</span>% Pump Adds <strong>+<span id="cardScale">50</span>% of Slot</strong></div>
     </div>
   </div>
 
-  <!-- MAIN WORKSPACE: LEFT = ACTIVE SHORTS | RIGHT = COMMAND NEW SHORT & ENGINE SETTINGS -->
+  <!-- MAIN WORKSPACE -->
   <div class="grid-main">
     <div class="card">
       <div class="sec-title">
         <span>🩸 Active 1x Short Positions (Win When Price Falls ↓)</span>
-        <span style="font-size:0.7rem;color:var(--cyan);">Tap "🔼 Raise Bar" Anytime</span>
+        <span style="font-size:0.7rem;color:var(--cyan);">Closing a Coin Blocks Auto-Rebuy</span>
       </div>
+      <div id="blockedBanner" style="display:none;" class="blocked-bar"></div>
       <div id="positionsBox"></div>
     </div>
 
@@ -1154,7 +1251,7 @@ HTML_UI = """
           </div>
           <div>
             <label>Short Amount to Deploy (USDT)</label>
-            <input type="number" id="customAmtInput" step="1" value="10" placeholder="e.g. 10" />
+            <input type="number" id="customAmtInput" step="10" value="100" placeholder="e.g. 100" />
           </div>
         </div>
         <button class="btn btn-crimson" style="width:100%;padding:11px;" onclick="launchCustomShort()">🩸 Launch Custom 1x Short Now</button>
@@ -1162,11 +1259,11 @@ HTML_UI = """
 
       <!-- ENGINE PARAMETERS -->
       <div class="card">
-        <div class="sec-title">⚙️ Auto-Pilot & Step-Up Bar Parameters</div>
+        <div class="sec-title">⚙️ Auto-Pilot & Proportional Step-Up Settings</div>
         <div class="input-grid-3">
           <div>
             <label>Auto-Short Size ($)</label>
-            <input type="number" id="cfgSize" step="1" value="10" />
+            <input type="number" id="cfgSize" step="10" value="100" />
           </div>
           <div>
             <label>Max Active Shorts</label>
@@ -1183,25 +1280,25 @@ HTML_UI = """
             <input type="number" id="cfgStepTrig" step="0.2" value="2.0" />
           </div>
           <div>
-            <label>Step-Up Add Amount ($)</label>
-            <input type="number" id="cfgStepAdd" step="1" value="5" />
+            <label>Step-Up Add Scale (% of Slot)</label>
+            <input type="number" id="cfgStepScale" step="5" value="50" />
           </div>
           <div>
             <label>Min Bear Score (40-95)</label>
             <input type="number" id="cfgBear" step="1" value="68" />
           </div>
         </div>
-        <button class="btn btn-install" style="width:100%;padding:11px;" onclick="saveConfig()">💾 Save Engine & Step-Up Settings</button>
+        <button class="btn btn-install" style="width:100%;padding:11px;" onclick="saveConfig()">💾 Save Engine & Proportional Step-Up Settings</button>
       </div>
     </div>
   </div>
 
-  <!-- BOTTOM WORKSPACE: LIVE 16-MARKET RADAR + COMPLETED PROFIT LEDGER -->
+  <!-- BOTTOM WORKSPACE -->
   <div class="grid-main">
     <div class="card">
       <div class="sec-title">
         <span>📡 16-Market Bearish Rejection Radar</span>
-        <span style="font-size:0.7rem;color:var(--muted);">Score >= 68 Auto-Shorts</span>
+        <span style="font-size:0.7rem;color:var(--muted);">Score >= 68 Auto-Shorts (Unless Blocked)</span>
       </div>
       <div style="overflow-x:auto; max-height:260px;">
         <table>
@@ -1298,7 +1395,7 @@ HTML_UI = """
   }
 
   async function resetUsdtBalance(keepProfits) {
-    const amt = document.getElementById('resetUsdtInput').value || 100;
+    const amt = document.getElementById('resetUsdtInput').value || 1000;
     await fetch('/api/reset_usdt_balance', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -1314,7 +1411,7 @@ HTML_UI = """
 
   async function launchCustomShort(pairOverride) {
     const pair = pairOverride || document.getElementById('customPairInput').value.trim();
-    const amt = document.getElementById('customAmtInput').value || 10;
+    const amt = document.getElementById('customAmtInput').value || 100;
     if (!pair) {
       alert('Select or type a token symbol first.');
       return;
@@ -1349,6 +1446,15 @@ HTML_UI = """
     await refresh();
   }
 
+  async function unblockPair(pair) {
+    await fetch('/api/unblock_pair', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ pair })
+    });
+    await refresh();
+  }
+
   async function toggleAP() {
     await fetch('/api/toggle_autopilot', { method: 'POST' });
     await refresh();
@@ -1373,7 +1479,7 @@ HTML_UI = """
         max_short_slots: document.getElementById('cfgMaxPos').value,
         skim_profit_pct: document.getElementById('cfgTarget').value,
         step_up_trigger_pct: document.getElementById('cfgStepTrig').value,
-        step_up_size_usdt: document.getElementById('cfgStepAdd').value,
+        step_up_scale_pct: document.getElementById('cfgStepScale').value,
         min_bear_score: document.getElementById('cfgBear').value
       })
     });
@@ -1387,33 +1493,55 @@ HTML_UI = """
       const s = await r.json();
 
       if (!cfgLoaded) {
-        document.getElementById('cfgSize').value = s.slot_size_usdt || 10;
+        document.getElementById('cfgSize').value = s.slot_size_usdt || 100;
         document.getElementById('cfgMaxPos').value = s.max_short_slots || 5;
         document.getElementById('cfgTarget').value = s.skim_profit_pct || 1.0;
         document.getElementById('cfgStepTrig').value = s.step_up_trigger_pct || 2.0;
-        document.getElementById('cfgStepAdd').value = s.step_up_size_usdt || 5;
+        document.getElementById('cfgStepScale').value = s.step_up_scale_pct || 50;
         document.getElementById('cfgBear').value = s.min_bear_score || 68;
-        document.getElementById('resetUsdtInput').value = s.paper_starting_bankroll || 100;
+        document.getElementById('resetUsdtInput').value = s.paper_starting_bankroll || 1000;
         cfgLoaded = true;
       }
 
       document.getElementById('lastUpdate').innerText = s.last_update;
       document.getElementById('scanMs').innerText = s.last_scan_ms;
       document.getElementById('cycleNum').innerText = s.cycle_count;
-      document.getElementById('ruleTrig').innerText = Number(s.step_up_trigger_pct || 2.0).toFixed(1);
-      document.getElementById('cardTrig').innerText = Number(s.step_up_trigger_pct || 2.0).toFixed(1);
-      document.getElementById('ruleAdd').innerText = Number(s.step_up_size_usdt || 5).toFixed(0);
+
+      const trigVal = Number(s.step_up_trigger_pct || 2.0).toFixed(1);
+      const scaleVal = Number(s.step_up_scale_pct || 50.0).toFixed(0);
+      document.getElementById('ruleTrig').innerText = trigVal;
+      document.getElementById('cardTrig').innerText = trigVal;
+      document.getElementById('ruleScale').innerText = scaleVal;
+      document.getElementById('cardScale').innerText = scaleVal;
 
       const needDrop = (Number(s.skim_profit_pct || 1.0) + Number(s.futures_fee_buffer_pct || 0.12)).toFixed(2);
       document.getElementById('dropNeededBox').innerText = '-' + needDrop + '% Drop';
 
-      document.getElementById('apBtn').innerText = s.auto_pilot ? '🤖 Auto-Pilot: ON' : '✋ Auto-Pilot: MANUAL';
+      const apBtn = document.getElementById('apBtn');
+      apBtn.innerText = s.auto_pilot ? '🤖 Auto-Pilot: ON' : '✋ Auto-Pilot: PAUSED';
+      apBtn.className = s.auto_pilot ? 'btn btn-crimson' : 'btn btn-outline';
+
       const modeBtn = document.getElementById('modeBtn');
       modeBtn.innerText = s.mode === 'LIVE' ? '🔀 Mode: LIVE FUTURES' : '🔀 Mode: PAPER';
       modeBtn.className = s.mode === 'LIVE' ? 'btn btn-install' : 'btn btn-amber';
 
       document.getElementById('apiStatus').innerText = '● ' + (s.api_status_msg || '');
       document.getElementById('apiRightBadge').innerText = s.api_connected ? '✅ Gate.io Connected' : 'Paste Keys for Live Mode';
+
+      const blocked = s.blocked_pairs || [];
+      const bBanner = document.getElementById('blockedBanner');
+      if (blocked.length > 0) {
+        bBanner.style.display = 'flex';
+        const chips = blocked.map(bp =>
+          `<span class="unblock-chip" onclick="unblockPair('${bp}')">🚫 ${bp} (Tap to Unblock)</span>`
+        ).join(' ');
+        bBanner.innerHTML = `
+          <div><strong>Closed & Blocked from Auto-Buy:</strong> ${chips}</div>
+          <button class="unblock-chip" onclick="unblockPair('ALL')">🔓 Unblock All</button>
+        `;
+      } else {
+        bBanner.style.display = 'none';
+      }
 
       const posMap = s.short_positions || {};
       const keys = Object.keys(posMap);
@@ -1434,7 +1562,7 @@ HTML_UI = """
 
       const pBox = document.getElementById('positionsBox');
       if (keys.length === 0) {
-        pBox.innerHTML = `<div style="text-align:center;color:#9ca3af;padding:22px;font-size:0.82rem;">No active shorts — Auto-Pilot is scanning or command one on the right.</div>`;
+        pBox.innerHTML = `<div style="text-align:center;color:#9ca3af;padding:22px;font-size:0.82rem;">No active shorts — Auto-Pilot is ${s.auto_pilot ? 'scanning unblocked coins' : 'PAUSED (Command a coin on the right)'}.</div>`;
       } else {
         pBox.innerHTML = keys.map(k => {
           const p = posMap[k];
@@ -1443,6 +1571,7 @@ HTML_UI = """
           const pnlUsdt = Number(p.pnl_usdt || 0);
           const steps = Number(p.step_ups_done || 0);
           const prog = Math.max(0, Math.min(100, (pnl / Number(s.skim_profit_pct || 1.0)) * 100));
+          const dynStepAdd = Number(p.next_step_add_usdt || (Number(p.base_slot_usdt || p.margin_usdt || 100) * (Number(s.step_up_scale_pct || 50) / 100)));
 
           return `
             <div class="pos-card">
@@ -1471,8 +1600,8 @@ HTML_UI = """
               <div class="track"><div class="fill" style="width:${prog.toFixed(1)}%"></div></div>
 
               <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
-                <button class="btn-step" onclick="stepUpNow('${p.pair}')">🔼 Raise Bar (+$${Number(s.step_up_size_usdt || 5).toFixed(0)})</button>
-                <button class="btn-del" onclick="closeSlot('${p.pair}')">✖ Close Short</button>
+                <button class="btn-step" onclick="stepUpNow('${p.pair}')">🔼 Raise Bar (+$${dynStepAdd.toFixed(0)} / ${scaleVal}%)</button>
+                <button class="btn-del" onclick="closeSlot('${p.pair}')">✖ Close & Block Rebuy</button>
               </div>
             </div>
           `;
@@ -1484,7 +1613,7 @@ HTML_UI = """
         const chgSign = item.change_24h >= 0 ? '+' : '';
         return `
           <tr>
-            <td><strong>${item.pair}</strong></td>
+            <td><strong>${item.pair}</strong> ${item.is_blocked ? '<span style="color:#f59e0b;font-size:0.65rem;">(BLOCKED)</span>' : ''}</td>
             <td>${fmtPx(item.price)} <span style="color:${item.change_24h < 0 ? '#ff2a5f' : '#00f5a0'}">(${chgSign}${item.change_24h}%)</span></td>
             <td><span class="short-pill">${item.bear_score}/100</span></td>
             <td>${item.rsi_14}</td>
