@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "bearskimmer_v2_0_state.json"
+STATE_FILE = "bearskimmer_v3_0_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -24,8 +24,8 @@ BEAR_UNIVERSE = [
 
 HTTP_SESSION = requests.Session()
 adapter = HTTPAdapter(
-    pool_connections=20,
-    pool_maxsize=20,
+    pool_connections=24,
+    pool_maxsize=24,
     max_retries=Retry(total=2, backoff_factor=0.15, status_forcelist=[502, 503, 504])
 )
 HTTP_SESSION.mount("https://", adapter)
@@ -48,11 +48,11 @@ def fmt_px(val):
 DEFAULT_STATE = {
     "mode": "PAPER",
     "auto_pilot": True,
-    "max_short_slots": 5,        # Keeps 50% cash free so Auto-Step-Up can raise the bar!
+    "max_short_slots": 5,
     "slot_size_usdt": 10.0,
-    "step_up_trigger_pct": 2.0,  # When coin pumps +2.0%, bot adds $5 top-up short to raise the bar
+    "step_up_trigger_pct": 2.0,
     "step_up_size_usdt": 5.0,
-    "max_step_ups": 2,           # Up to 2 automatic bar-raises per coin
+    "max_step_ups": 2,
     "min_bear_score": 68,
     "skim_profit_pct": 1.00,
     "trail_bounce_pct": 0.22,
@@ -60,9 +60,10 @@ DEFAULT_STATE = {
     "api_key": os.environ.get("GATE_API_KEY", "").strip(),
     "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
     "api_connected": False,
-    "api_status_msg": "Paper Mode ($100 Sim)",
+    "api_status_msg": "Not Connected — Paste Gate.io Keys Below for Live Mode",
     "live_futures_usdt": 0.0,
     "paper_usdt_balance": 100.0,
+    "paper_starting_bankroll": 100.0,
     "short_positions": {},
     "radar": [],
     "stats": {
@@ -88,12 +89,12 @@ STATE = json.loads(json.dumps(DEFAULT_STATE))
 def add_log(msg):
     ts = datetime.utcnow().strftime("%H:%M:%S")
     STATE["logs"].insert(0, f"[{ts}] {msg}")
-    STATE["logs"] = STATE["logs"][:80]
+    STATE["logs"] = STATE["logs"][:120]
 
 
 def load_state():
     global STATE
-    for fn in [STATE_FILE, "bearskimmer_v1_2_state.json", "bearskimmer_v1_state.json"]:
+    for fn in [STATE_FILE, "bearskimmer_v2_0_state.json", "bearskimmer_v1_2_state.json", "bearskimmer_v1_state.json"]:
         if os.path.exists(fn):
             try:
                 with open(fn, "r") as f:
@@ -108,9 +109,7 @@ def load_state():
                     STATE.setdefault("step_up_trigger_pct", 2.0)
                     STATE.setdefault("step_up_size_usdt", 5.0)
                     STATE.setdefault("max_step_ups", 2)
-                    # Cap max slots to 5 if previously 10 so reserve exists for step-up
-                    if int(STATE.get("max_short_slots", 5)) > 6:
-                        STATE["max_short_slots"] = 5
+                    STATE.setdefault("paper_starting_bankroll", 100.0)
                 break
             except Exception as e:
                 add_log(f"State load notice: {e}")
@@ -161,7 +160,8 @@ def fetch_futures_tickers(pairs):
             if last > 0:
                 out[c] = {
                     "last": last,
-                    "change_24h": float(t.get("change_percentage") or 0.0)
+                    "change_24h": float(t.get("change_percentage") or 0.0),
+                    "funding_rate": float(t.get("funding_rate") or 0.0) * 100.0
                 }
     return out
 
@@ -185,7 +185,7 @@ def fetch_futures_usdt_balance(custom_key=None, custom_secret=None):
     headers = gate_sign("GET", url, "", "", custom_key, custom_secret)
     r = HTTP_SESSION.get(f"{GATE_HOST}{url}", headers=headers, timeout=5)
     if r.status_code != 200:
-        raise ValueError(f"Gate.io HTTP {r.status_code}")
+        raise ValueError(f"Gate.io Futures HTTP {r.status_code}: {r.text[:80]}")
     return float(r.json().get("available") or 0.0)
 
 
@@ -256,7 +256,7 @@ def compute_bear_score(pair, tk):
 
     if rsi_14 < 38:
         s_rsi = 5.0
-    elif 48 <= rsi_14 <= 75:
+    elif 46 <= rsi_14 <= 74:
         s_rsi = 38.0
     else:
         s_rsi = 25.0
@@ -265,6 +265,15 @@ def compute_bear_score(pair, tk):
     s_rej = (15.0 if upper_wick else 6.0) + (12.0 if tk["change_24h"] < 0 else 4.0)
     bear_score = int(round(max(1.0, min(99.0, s_rsi + s_ob + s_rej))))
 
+    if bear_score >= 74:
+        sig = "SNIPE SHORT TOP"
+    elif bear_score >= 66:
+        sig = "BEAR REJECTION"
+    elif rsi_14 < 38:
+        sig = "OVERSOLD — WAIT"
+    else:
+        sig = "NEUTRAL"
+
     res = {
         "pair": pair,
         "price": price,
@@ -272,6 +281,7 @@ def compute_bear_score(pair, tk):
         "bear_score": bear_score,
         "rsi_14": round(rsi_14, 1),
         "ask_sell_pct": round(ask_sell_pct, 1),
+        "signal": sig,
         "ts": now
     }
     BEAR_RADAR_CACHE[pair] = res
@@ -290,7 +300,7 @@ def place_futures_short_order(contract, size_contracts):
 
 
 # =============================================================================
-# MAIN CYCLE (WITH AUTO-STEP-UP BAR MOVER WHEN COINS PUMP +2%)
+# MAIN EXECUTION ENGINE (WITH AUTO-STEP-UP BAR MOVER)
 # =============================================================================
 def run_bear_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
@@ -319,11 +329,11 @@ def run_bear_cycle(force_manual=False):
                 with state_lock:
                     STATE["api_connected"] = True
                     STATE["live_futures_usdt"] = fut_usdt
-                    STATE["api_status_msg"] = f"Gate.io Connected (${fut_usdt:.2f} USDT)"
+                    STATE["api_status_msg"] = f"Gate.io Futures Connected (Available: ${fut_usdt:.2f} USDT)"
             except Exception as e:
                 with state_lock:
                     STATE["api_connected"] = False
-                    STATE["api_status_msg"] = f"API Notice: {str(e)[:45]}"
+                    STATE["api_status_msg"] = f"API Notice: {str(e)[:50]}"
 
         all_pairs = list(set(BEAR_UNIVERSE + active_pairs))
         try:
@@ -351,11 +361,7 @@ def run_bear_cycle(force_manual=False):
             steps_done = int(pos.get("step_ups_done", 0))
             last_step_px = float(pos.get("last_step_price") or entry_px)
 
-            # -----------------------------------------------------------------
-            # AUTO-STEP-UP BAR MOVER:
-            # If the coin pumps +2.0% above our last entry, add a $5 top-up
-            # short at the higher price to pull both our Entry Bar & Target UP!
-            # -----------------------------------------------------------------
+            # AUTO-STEP-UP BAR MOVER WHEN COIN PUMPS +2.0%
             pump_from_last_pct = ((live_px - last_step_px) / last_step_px) * 100.0
             if steps_done < max_steps and pump_from_last_pct >= step_trigger_pct:
                 if mode == "PAPER" and STATE.get("paper_usdt_balance", 0.0) >= step_add_usdt:
@@ -376,10 +382,35 @@ def run_bear_cycle(force_manual=False):
                         margin_usdt = new_margin
                         new_target = entry_px * (1.0 - (required_drop_pct / 100.0))
                         add_log(
-                            f"🔼 [BAR STEPPED UP #{steps_done+1}][{pair}] Coin pumped +{pump_from_last_pct:.1f}% to {fmt_px(live_px)}! "
-                            f"Added ${step_add_usdt:.0f} short -> Entry Bar raised {fmt_px(old_entry)} → {fmt_px(entry_px)} "
+                            f"🔼 [AUTO BAR RAISE #{steps_done+1}][{pair}] Pumped +{pump_from_last_pct:.1f}% to {fmt_px(live_px)}! "
+                            f"Added ${step_add_usdt:.0f} -> Entry Bar raised {fmt_px(old_entry)} → {fmt_px(entry_px)} "
                             f"(New Target: {fmt_px(new_target)})"
                         )
+                elif mode == "LIVE" and has_keys and STATE.get("live_futures_usdt", 0.0) >= step_add_usdt:
+                    meta = get_contract_meta(pair)
+                    c_val = live_px * meta["quanto_multiplier"]
+                    add_contracts = max(1, int(step_add_usdt / max(1e-9, c_val)))
+                    actual_add_usdt = round(add_contracts * c_val, 4)
+                    code, _ = place_futures_short_order(pair, -add_contracts)
+                    if code in (200, 201):
+                        with state_lock:
+                            old_entry = entry_px
+                            old_units = margin_usdt / entry_px
+                            add_units = actual_add_usdt / live_px
+                            new_margin = round(margin_usdt + actual_add_usdt, 4)
+                            new_avg_entry = new_margin / (old_units + add_units)
+                            STATE["live_futures_usdt"] = max(0.0, STATE["live_futures_usdt"] - actual_add_usdt)
+                            pos["contracts"] = int(pos.get("contracts", 1)) + add_contracts
+                            pos["margin_usdt"] = new_margin
+                            pos["entry_price"] = new_avg_entry
+                            pos["last_step_price"] = live_px
+                            pos["step_ups_done"] = steps_done + 1
+                            entry_px = new_avg_entry
+                            margin_usdt = new_margin
+                            add_log(
+                                f"🔼 [LIVE BAR RAISE #{steps_done+1}][{pair}] Added ${actual_add_usdt:.2f} short -> "
+                                f"Entry Bar raised {fmt_px(old_entry)} → {fmt_px(entry_px)}"
+                            )
 
             pos["last_price"] = live_px
             target_buyback_px = entry_px * (1.0 - (required_drop_pct / 100.0))
@@ -401,7 +432,7 @@ def run_bear_cycle(force_manual=False):
                 if not pos.get("trailing_active"):
                     pos["trailing_active"] = True
                     pos["lowest_price"] = live_px
-                    pos["status"] = f"🔥 Target Hit! Trailing Profit Lock Armed (+{net_pnl_pct:.2f}%)"
+                    pos["status"] = f"🔥 Target Hit! Trailing Waterfall Lock Armed (+{net_pnl_pct:.2f}%)"
                 else:
                     if live_px < float(pos.get("lowest_price", live_px)):
                         pos["lowest_price"] = live_px
@@ -420,11 +451,11 @@ def run_bear_cycle(force_manual=False):
                     next_step_px = last_step_px * (1.0 + (step_trigger_pct / 100.0))
                     if int(pos.get("step_ups_done", 0)) < max_steps:
                         pos["status"] = (
-                            f"Need -{need_drop:.2f}% drop to win | "
+                            f"Need -{need_drop:.2f}% drop to target | "
                             f"Auto-Raises Bar if price hits {fmt_px(next_step_px)}"
                         )
                     else:
-                        pos["status"] = f"Bar Raised {pos.get('step_ups_done')}x — Waiting for -{need_drop:.2f}% drop"
+                        pos["status"] = f"Bar Raised {pos.get('step_ups_done')}x (Max) — Waiting for -{need_drop:.2f}% drop"
 
             if should_close_short:
                 profit_usdt = max(0.01, round(margin_usdt * (max(skim_pct, net_pnl_pct) / 100.0), 4))
@@ -439,17 +470,38 @@ def run_bear_cycle(force_manual=False):
                         )
                         STATE["skim_ledger"].insert(0, {
                             "time": datetime.utcnow().strftime("%H:%M:%S"),
-                            "pair": pair,
+                            "pair": f"{pair} (PAPER)",
                             "drop": f"-{raw_drop_gain_pct:.2f}%",
                             "short_to_cover": f"{fmt_px(entry_px)} → {fmt_px(live_px)}",
                             "profit": f"+${profit_usdt:.4f}"
                         })
                         add_log(
-                            f"💎 [BEAR SKIM WON][{pair}] Covered @ {fmt_px(live_px)} | Banked +${profit_usdt:.4f}!"
+                            f"🩸💎 [BEAR SKIM WON][{pair}] Covered @ {fmt_px(live_px)} | Banked +${profit_usdt:.4f}!"
                         )
                         STATE["short_positions"].pop(pair, None)
+                elif mode == "LIVE" and has_keys:
+                    contracts = int(pos.get("contracts", 1))
+                    code, _ = place_futures_short_order(pair, abs(contracts))
+                    if code in (200, 201):
+                        with state_lock:
+                            STATE["stats"]["live_skims"] += 1
+                            STATE["stats"]["live_profit_usdt"] = round(
+                                STATE["stats"]["live_profit_usdt"] + profit_usdt, 4
+                            )
+                            STATE["skim_ledger"].insert(0, {
+                                "time": datetime.utcnow().strftime("%H:%M:%S"),
+                                "pair": f"{pair} (LIVE)",
+                                "drop": f"-{raw_drop_gain_pct:.2f}%",
+                                "short_to_cover": f"{fmt_px(entry_px)} → {fmt_px(live_px)}",
+                                "profit": f"+${profit_usdt:.4f}"
+                            })
+                            add_log(
+                                f"🩸💎 [LIVE BEAR SKIM][{pair}] Closed Short @ {fmt_px(live_px)} | "
+                                f"Banked +${profit_usdt:.4f}!"
+                            )
+                            STATE["short_positions"].pop(pair, None)
 
-        # 3) OPEN NEW AUTONOMOUS SHORTS (MAX 5 SO 50% CASH STAYS IN STEP-UP RESERVE)
+        # 3) OPEN NEW AUTONOMOUS SHORTS
         if auto_pilot and len(STATE["short_positions"]) < max_slots:
             for cand in radar_list:
                 with state_lock:
@@ -489,11 +541,42 @@ def run_bear_cycle(force_manual=False):
                             "lowest_price": c_price,
                             "status": f"1x Short Opened (Score {cand['bear_score']}/100)"
                         }
-                        add_log(f"🩸 [NEW SHORT][{c_pair}] ${slot_size:.0f} @ {fmt_px(c_price)} (Target: {fmt_px(target_px)})")
+                        add_log(f"🩸 [AUTO-SHORT][{c_pair}] ${slot_size:.0f} @ {fmt_px(c_price)} (Target: {fmt_px(target_px)})")
+                elif mode == "LIVE" and has_keys:
+                    avail_fut = float(STATE.get("live_futures_usdt", 0.0))
+                    if avail_fut < slot_size:
+                        break
+                    meta = get_contract_meta(c_pair)
+                    c_val = c_price * meta["quanto_multiplier"]
+                    num_contracts = max(1, int(slot_size / max(1e-9, c_val)))
+                    actual_notional = round(num_contracts * c_val, 4)
+                    code, _ = place_futures_short_order(c_pair, -num_contracts)
+                    if code in (200, 201):
+                        with state_lock:
+                            STATE["live_futures_usdt"] = max(0.0, avail_fut - actual_notional)
+                            STATE["short_positions"][c_pair] = {
+                                "pair": c_pair,
+                                "contracts": num_contracts,
+                                "margin_usdt": actual_notional,
+                                "current_equity_usdt": actual_notional,
+                                "entry_price": c_price,
+                                "last_step_price": c_price,
+                                "step_ups_done": 0,
+                                "last_price": c_price,
+                                "target_buyback_price": target_px,
+                                "coin_move_pct": 0.0,
+                                "pnl_pct": -fee_buf,
+                                "pnl_usdt": round(-actual_notional * (fee_buf / 100.0), 4),
+                                "bear_score": cand["bear_score"],
+                                "trailing_active": False,
+                                "lowest_price": c_price,
+                                "status": f"Live 1x Short ({num_contracts} contracts)"
+                            }
+                            add_log(f"🩸 [LIVE SHORT][{c_pair}] ${actual_notional:.2f} @ {fmt_px(c_price)}")
 
         with state_lock:
-            STATE["radar"] = radar_list[:8]
-            STATE["skim_ledger"] = STATE["skim_ledger"][:40]
+            STATE["radar"] = radar_list[:12]
+            STATE["skim_ledger"] = STATE["skim_ledger"][:50]
             STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
             STATE["last_scan_ms"] = int((time.time() - t0) * 1000)
             STATE["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
@@ -506,7 +589,7 @@ def run_bear_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("🩸 BearSkimmer v2.0 Online — Auto-Step-Up Bar Mover (+2% Pump Rescuer) Active.")
+    add_log("🩸 BearSkimmer v3.0 PRO Online — Institutional Terminal + Auto-Step-Up Bar Mover Active.")
     while True:
         run_bear_cycle(force_manual=False)
         time.sleep(3.5)
@@ -526,14 +609,17 @@ def check_worker():
     ensure_worker_alive()
 
 
+# =============================================================================
+# PWA MOBILE INSTALLER ENDPOINTS
+# =============================================================================
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
-        "name": "BearSkimmer v2.0",
+        "name": "BearSkimmer v3.0 PRO",
         "short_name": "BearSkimmer",
         "start_url": "/",
         "display": "standalone",
-        "background_color": "#07040a",
+        "background_color": "#060309",
         "theme_color": "#ff2a5f",
         "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
     })
@@ -555,6 +641,9 @@ def pwa_sw():
     return Response("self.addEventListener('fetch', e => {});", mimetype="application/javascript")
 
 
+# =============================================================================
+# API ENDPOINTS (CUSTOM SHORT, RESET USDT, SYNC KEYS, CONFIG, STEP-UP)
+# =============================================================================
 @app.route("/api/state")
 def api_state():
     if STATE["cycle_count"] == 0:
@@ -566,9 +655,161 @@ def api_state():
         return jsonify(safe)
 
 
+@app.route("/api/scan_now", methods=["POST"])
+def api_scan_now():
+    run_bear_cycle(force_manual=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/toggle_autopilot", methods=["POST"])
+def api_toggle_autopilot():
+    with state_lock:
+        STATE["auto_pilot"] = not bool(STATE.get("auto_pilot", True))
+        add_log(f"🤖 Bear Auto-Pilot switched to: {'ON' if STATE['auto_pilot'] else 'MANUAL'}")
+        save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/toggle_mode", methods=["POST"])
+def api_toggle_mode():
+    with state_lock:
+        STATE["mode"] = "LIVE" if STATE.get("mode") == "PAPER" else "PAPER"
+        add_log(f"🔀 Switched BearSkimmer Mode to: {STATE['mode']}")
+        save_state()
+    run_bear_cycle(force_manual=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/reset_usdt_balance", methods=["POST"])
+def api_reset_usdt_balance():
+    """Resets Paper USDT balance to user-specified amount (default $100) and clears stuck paper positions."""
+    d = request.json or {}
+    raw_amt = d.get("amount_usdt", 100.0)
+    keep_profits = bool(d.get("keep_profits", False))
+    try:
+        new_bal = max(10.0, float(raw_amt))
+    except Exception:
+        new_bal = 100.0
+
+    with state_lock:
+        STATE["paper_usdt_balance"] = round(new_bal, 4)
+        STATE["paper_starting_bankroll"] = round(new_bal, 4)
+        STATE["short_positions"] = {}
+        if not keep_profits:
+            STATE["stats"]["paper_skims"] = 0
+            STATE["stats"]["paper_profit_usdt"] = 0.0
+            STATE["skim_ledger"] = []
+            add_log(f"💰 Reset Paper Bankroll to ${new_bal:.2f} USDT & cleared Profit Vault!")
+        else:
+            add_log(f"🔄 Reset Paper Bankroll to ${new_bal:.2f} USDT (Kept Profit Vault intact)!")
+        save_state()
+    run_bear_cycle(force_manual=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/reset_profit_vault", methods=["POST"])
+def api_reset_profit_vault():
+    with state_lock:
+        STATE["stats"]["paper_skims"] = 0
+        STATE["stats"]["paper_profit_usdt"] = 0.0
+        STATE["stats"]["live_skims"] = 0
+        STATE["stats"]["live_profit_usdt"] = 0.0
+        STATE["skim_ledger"] = []
+        add_log("🧹 Reset Profit Vault & Skim Ledger to $0.0000.")
+        save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/manual_short", methods=["POST"])
+def api_manual_short():
+    d = request.json or {}
+    raw_pair = (d.get("pair") or "").strip().upper().replace("/", "_").replace("-", "_")
+    if not raw_pair:
+        return jsonify({"ok": False, "error": "Enter a Token Symbol first (e.g. SUI, PEPE, DOGE)"}), 400
+    pair = raw_pair if "_" in raw_pair else f"{raw_pair}_USDT"
+
+    raw_amt = d.get("amount_usdt")
+    custom_size = float(raw_amt) if (raw_amt and float(raw_amt) >= 2.0) else float(STATE.get("slot_size_usdt", 10.0))
+
+    with state_lock:
+        if pair in STATE["short_positions"]:
+            return jsonify({"ok": False, "error": f"{pair} is already in your Active Shorts"}), 400
+
+    try:
+        tk_map = fetch_futures_tickers([pair])
+        if pair not in tk_map:
+            return jsonify({"ok": False, "error": f"Futures contract {pair} not found on Gate.io"}), 400
+        c_price = tk_map[pair]["last"]
+        fee_buf = float(STATE.get("futures_fee_buffer_pct", 0.12))
+        req_drop = float(STATE.get("skim_profit_pct", 1.0)) + fee_buf
+        target_px = c_price * (1.0 - (req_drop / 100.0))
+
+        with state_lock:
+            avail = float(STATE.get("paper_usdt_balance", 100.0))
+            if STATE["mode"] == "PAPER" and avail < custom_size:
+                return jsonify({"ok": False, "error": f"Insufficient Free Paper USDT (${avail:.2f})"}), 400
+
+            if STATE["mode"] == "PAPER":
+                STATE["paper_usdt_balance"] = round(avail - custom_size, 4)
+                STATE["short_positions"][pair] = {
+                    "pair": pair,
+                    "margin_usdt": custom_size,
+                    "current_equity_usdt": custom_size,
+                    "entry_price": c_price,
+                    "last_step_price": c_price,
+                    "step_ups_done": 0,
+                    "last_price": c_price,
+                    "target_buyback_price": target_px,
+                    "coin_move_pct": 0.0,
+                    "pnl_pct": -fee_buf,
+                    "pnl_usdt": round(-custom_size * (fee_buf / 100.0), 4),
+                    "bear_score": 85,
+                    "trailing_active": False,
+                    "lowest_price": c_price,
+                    "status": "Commanded Custom 1x Short"
+                }
+                add_log(f"⚡ [CUSTOM SHORT][{pair}] Shorted ${custom_size:.2f} @ {fmt_px(c_price)} (Target: {fmt_px(target_px)})")
+                save_state()
+                return jsonify({"ok": True})
+            else:
+                avail_fut = float(STATE.get("live_futures_usdt", 0.0))
+                if avail_fut < custom_size:
+                    return jsonify({"ok": False, "error": f"Insufficient Gate.io Futures USDT (${avail_fut:.2f})"}), 400
+                meta = get_contract_meta(pair)
+                c_val = c_price * meta["quanto_multiplier"]
+                num_c = max(1, int(custom_size / max(1e-9, c_val)))
+                actual_notional = round(num_c * c_val, 4)
+                code, resp = place_futures_short_order(pair, -num_c)
+                if code in (200, 201):
+                    STATE["live_futures_usdt"] = max(0.0, avail_fut - actual_notional)
+                    STATE["short_positions"][pair] = {
+                        "pair": pair,
+                        "contracts": num_c,
+                        "margin_usdt": actual_notional,
+                        "current_equity_usdt": actual_notional,
+                        "entry_price": c_price,
+                        "last_step_price": c_price,
+                        "step_ups_done": 0,
+                        "last_price": c_price,
+                        "target_buyback_price": target_px,
+                        "coin_move_pct": 0.0,
+                        "pnl_pct": -fee_buf,
+                        "pnl_usdt": round(-actual_notional * (fee_buf / 100.0), 4),
+                        "bear_score": 85,
+                        "trailing_active": False,
+                        "lowest_price": c_price,
+                        "status": f"Live Custom Short ({num_c} contracts)"
+                    }
+                    add_log(f"⚡ [LIVE CUSTOM SHORT][{pair}] Shorted ${actual_notional:.2f} @ {fmt_px(c_price)}")
+                    save_state()
+                    return jsonify({"ok": True})
+                return jsonify({"ok": False, "error": str(resp)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @app.route("/api/step_up_now", methods=["POST"])
 def api_step_up_now():
-    """Manual 1-tap button to raise the Entry & Target bar on any coin that pumped."""
     pair = (request.json or {}).get("pair", "")
     with state_lock:
         pos = STATE["short_positions"].get(pair)
@@ -576,7 +817,7 @@ def api_step_up_now():
             return jsonify({"ok": False, "error": "Position not found"}), 400
         step_add = float(STATE.get("step_up_size_usdt", 5.0))
         if STATE.get("paper_usdt_balance", 0.0) < step_add:
-            return jsonify({"ok": False, "error": f"Need ${step_add:.2f} in Free USDT Reserve to Step-Up Bar"}), 400
+            return jsonify({"ok": False, "error": f"Need ${step_add:.2f} in Free USDT Reserve to Raise Bar"}), 400
 
         live_px = float(pos["last_price"])
         old_entry = float(pos["entry_price"])
@@ -598,21 +839,8 @@ def api_step_up_now():
 
         add_log(
             f"🔼 [MANUAL BAR RAISE][{pair}] Added ${step_add:.0f} @ {fmt_px(live_px)} -> "
-            f"Bar moved {fmt_px(old_entry)} → {fmt_px(new_entry)} (New Target: {fmt_px(new_target)})"
+            f"Entry Bar raised {fmt_px(old_entry)} → {fmt_px(new_entry)} (New Target: {fmt_px(new_target)})"
         )
-        save_state()
-    run_bear_cycle(force_manual=True)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/reset_paper", methods=["POST"])
-def api_reset_paper():
-    with state_lock:
-        # Keep existing profit vault if user just wants to free up the 10 stuck slots, or reset cleanly
-        STATE["paper_usdt_balance"] = 100.0 + float(STATE["stats"].get("paper_profit_usdt", 0.0))
-        STATE["short_positions"] = {}
-        STATE["max_short_slots"] = 5
-        add_log("🔄 Rebalanced slots to 5 Max (keeping your $2+ profit intact & 50% cash in Step-Up Reserve!).")
         save_state()
     run_bear_cycle(force_manual=True)
     return jsonify({"ok": True})
@@ -627,21 +855,65 @@ def api_close_short_slot():
             STATE["paper_usdt_balance"] = round(
                 STATE.get("paper_usdt_balance", 0.0) + float(pos.get("current_equity_usdt", 0.0)), 4
             )
-            add_log(f"Closed {pair} short slot.")
+            add_log(f"Closed {pair} short slot & returned ${pos.get('current_equity_usdt', 0.0):.2f} to Free USDT.")
             save_state()
     return jsonify({"ok": True})
 
 
-@app.route("/api/toggle_autopilot", methods=["POST"])
-def api_toggle_autopilot():
+@app.route("/api/update_config", methods=["POST"])
+def api_update_config():
+    d = request.json or {}
     with state_lock:
-        STATE["auto_pilot"] = not bool(STATE.get("auto_pilot", True))
+        if d.get("slot_size_usdt"):
+            STATE["slot_size_usdt"] = max(2.0, float(d["slot_size_usdt"]))
+        if d.get("max_short_slots"):
+            STATE["max_short_slots"] = max(1, min(12, int(d["max_short_slots"])))
+        if d.get("skim_profit_pct"):
+            STATE["skim_profit_pct"] = max(0.2, float(d["skim_profit_pct"]))
+        if d.get("step_up_trigger_pct"):
+            STATE["step_up_trigger_pct"] = max(0.5, float(d["step_up_trigger_pct"]))
+        if d.get("step_up_size_usdt"):
+            STATE["step_up_size_usdt"] = max(1.0, float(d["step_up_size_usdt"]))
+        if d.get("min_bear_score"):
+            STATE["min_bear_score"] = max(40, min(95, int(d["min_bear_score"])))
+        add_log(
+            f"⚙️ Saved Engine Parameters: Base=${STATE['slot_size_usdt']:.0f} | Max Slots={STATE['max_short_slots']} | "
+            f"Skim=+{STATE['skim_profit_pct']}% | Step-Up=+{STATE['step_up_trigger_pct']}% (+${STATE['step_up_size_usdt']:.0f})"
+        )
         save_state()
+    run_bear_cycle(force_manual=True)
     return jsonify({"ok": True})
 
 
+@app.route("/api/sync_keys", methods=["POST"])
+def api_sync_keys():
+    d = request.json or {}
+    rk = (d.get("api_key") or "").strip().replace(" ", "").replace("\n", "").replace("\r", "")
+    rs = (d.get("api_secret") or "").strip().replace(" ", "").replace("\n", "").replace("\r", "")
+    with state_lock:
+        if rk and "Saved" not in rk:
+            STATE["api_key"] = rk
+        if rs and "Saved" not in rs:
+            STATE["api_secret"] = rs
+        ak = STATE.get("api_key", "")
+        asec = STATE.get("api_secret", "")
+    if not ak or not asec:
+        return jsonify({"ok": False, "error": "Paste both Gate.io API Key and Secret"}), 400
+    try:
+        u = fetch_futures_usdt_balance(ak, asec)
+        with state_lock:
+            STATE["api_connected"] = True
+            STATE["live_futures_usdt"] = u
+            STATE["api_status_msg"] = f"Verified! Gate.io Futures USDT: ${u:.2f}"
+            add_log(f"🔗 Gate.io v4 Futures API Verified! Available USDT: ${u:.2f}")
+            save_state()
+        return jsonify({"ok": True, "usdt_balance": u})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:80]}), 400
+
+
 # =============================================================================
-# CLEAN, SIMPLIFIED MOBILE-FIRST UI (BEARSKIMMER v2.0)
+# PEAK INSTITUTIONAL UI — BEARSKIMMER v3.0 PRO
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -652,125 +924,327 @@ HTML_UI = """
   <meta name="theme-color" content="#ff2a5f" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/icon.svg" />
-  <title>BearSkimmer v2.0 | Simple Auto-Step-Up Short Bot</title>
+  <title>BearSkimmer v3.0 PRO | Institutional Short Engine</title>
   <style>
     :root {
-      --bg: #08050c;
-      --card: #130c1c;
-      --border: #2c1a3d;
+      --bg: #060309;
+      --card: rgba(18, 11, 26, 0.94);
+      --border: #311c42;
       --crimson: #ff2a5f;
       --neon: #00f5a0;
-      --amber: #f59e0b;
       --cyan: #00d9f5;
+      --amber: #f59e0b;
+      --purple: #a855f7;
       --text: #f8fafc;
       --muted: #9ca3af;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 12px; max-width: 720px; margin: 0 auto; }
-
-    .top-bar {
-      background: linear-gradient(135deg, rgba(255,42,95,0.18), rgba(19,12,28,0.95));
-      border: 1px solid rgba(255,42,95,0.45); border-radius: 16px; padding: 14px 16px; margin-bottom: 12px;
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, system-ui, sans-serif; }
+    body {
+      background: radial-gradient(circle at 50% 0%, #2b0920 0%, #060309 75%);
+      color: var(--text); padding: 14px; min-height: 100vh;
     }
-    .title-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-    .logo { font-size: 1.25rem; font-weight: 900; display: flex; align-items: center; gap: 8px; }
-    .badge { background: var(--crimson); color: #fff; font-size: 0.68rem; padding: 3px 8px; border-radius: 99px; }
-    .sub { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
+    .wrap { max-width: 1240px; margin: 0 auto; }
 
-    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-    .btn { cursor: pointer; border: none; border-radius: 10px; padding: 9px 12px; font-weight: 800; font-size: 0.76rem; flex: 1; text-align: center; }
-    .btn-neon { background: linear-gradient(135deg, var(--neon), var(--cyan)); color: #022c22; }
-    .btn-crimson { background: var(--crimson); color: #fff; }
-    .btn-outline { background: rgba(255,42,95,0.14); border: 1px solid var(--crimson); color: #fda4af; }
+    /* HERO HEADER */
+    .hero {
+      background: linear-gradient(135deg, rgba(255, 42, 95, 0.16), rgba(168, 85, 247, 0.12));
+      border: 1px solid rgba(255, 42, 95, 0.45); border-radius: 18px; padding: 16px 20px; margin-bottom: 14px;
+      box-shadow: 0 14px 36px rgba(0,0,0,0.65);
+    }
+    .hero-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+    .logo { font-size: 1.5rem; font-weight: 900; display: flex; align-items: center; gap: 10px; letter-spacing: 0.4px; }
+    .badge { background: linear-gradient(135deg, var(--crimson), #ff6b35); color: #fff; font-size: 0.72rem; font-weight: 900; padding: 3px 10px; border-radius: 99px; }
+    .sub { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
 
-    .score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 13px 14px; }
-    .lbl { font-size: 0.68rem; font-weight: 800; text-transform: uppercase; color: var(--muted); }
-    .val { font-size: 1.35rem; font-weight: 900; margin: 4px 0; font-variant-numeric: tabular-nums; }
-    .c-neon { color: var(--neon); }
-    .c-crimson { color: var(--crimson); }
-    .c-cyan { color: var(--cyan); }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .btn { cursor: pointer; border: none; border-radius: 10px; padding: 9px 14px; font-weight: 800; font-size: 0.77rem; transition: all 0.12s ease; }
+    .btn:active { transform: scale(0.97); }
+    .btn-install { background: linear-gradient(135deg, var(--neon), var(--cyan)); color: #022c22; box-shadow: 0 0 14px rgba(0,245,160,0.3); }
+    .btn-crimson { background: linear-gradient(135deg, var(--crimson), #e11d48); color: #fff; }
+    .btn-amber { background: linear-gradient(135deg, #f59e0b, #d97706); color: #1e1b4b; }
+    .btn-outline { background: rgba(255, 42, 95, 0.15); border: 1px solid var(--crimson); color: #fda4af; }
 
+    .strip {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.08);
+      font-size: 0.77rem; color: var(--muted); gap: 10px;
+    }
+
+    /* API KEY & BANKROLL BAR */
+    .top-panels { display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; margin-bottom: 14px; }
+    @media (max-width: 920px) { .top-panels { grid-template-columns: 1fr; } }
+
+    .panel-card {
+      background: linear-gradient(135deg, rgba(20, 11, 29, 0.96), rgba(34, 11, 29, 0.9));
+      border: 1px solid #451c3c; border-radius: 15px; padding: 14px 16px;
+    }
     .sec-title { font-size: 0.82rem; font-weight: 900; text-transform: uppercase; color: #fda4af; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+    .api-grid { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: end; }
+    @media (max-width: 640px) { .api-grid { grid-template-columns: 1fr; } }
+
+    /* 4 SCOREBOARD CARDS */
+    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(225px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 15px; padding: 15px 16px; }
+    .lbl { font-size: 0.7rem; font-weight: 800; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+    .val { font-size: 1.45rem; font-weight: 900; margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
+    .c-crimson { color: var(--crimson); }
+    .c-neon { color: var(--neon); }
+    .c-cyan { color: var(--cyan); }
+    .c-amber { color: var(--amber); }
+
+    /* MAIN 2-COLUMN WORKSPACE */
+    .grid-main { display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px; margin-bottom: 14px; }
+    @media (max-width: 960px) { .grid-main { grid-template-columns: 1fr; } }
+
     .pos-card {
-      background: #191024; border: 1px solid #3d204f; border-radius: 12px; padding: 12px 14px; margin-bottom: 10px;
+      background: linear-gradient(180deg, rgba(33, 15, 42, 0.96), rgba(16, 8, 22, 0.96));
+      border: 1px solid #4a1f43; border-radius: 14px; padding: 13px 15px; margin-bottom: 10px;
     }
-    .step-badge {
-      background: rgba(0, 217, 245, 0.15); border: 1px solid var(--cyan); color: var(--cyan);
-      font-size: 0.68rem; font-weight: 800; padding: 2px 7px; border-radius: 6px;
+    .step-pill { background: rgba(0, 217, 245, 0.16); border: 1px solid var(--cyan); color: var(--cyan); font-size: 0.68rem; font-weight: 800; padding: 2px 8px; border-radius: 99px; }
+    .short-pill { background: rgba(255, 42, 95, 0.2); border: 1px solid var(--crimson); color: #fda4af; font-size: 0.68rem; font-weight: 800; padding: 2px 8px; border-radius: 99px; }
+
+    .metrics-box {
+      background: rgba(6, 3, 9, 0.65); border: 1px solid #2d173b; border-radius: 10px; padding: 9px 11px; margin: 8px 0;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 0.75rem;
     }
-    .bar-box {
-      background: #0d0814; border: 1px solid #2c1a3d; border-radius: 9px; padding: 8px 10px; margin: 8px 0;
-      display: flex; justify-content: space-between; align-items: center; font-size: 0.76rem;
-    }
+    .track { height: 8px; background: #050208; border-radius: 99px; overflow: hidden; border: 1px solid #2d173b; margin: 7px 0; }
+    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--crimson), var(--neon)); transition: width 0.35s ease; }
+
     .btn-step {
       background: rgba(0, 245, 160, 0.16); border: 1px solid var(--neon); color: var(--neon);
-      padding: 5px 10px; border-radius: 8px; font-size: 0.71rem; font-weight: 800; cursor: pointer;
+      padding: 5px 10px; border-radius: 8px; font-size: 0.72rem; font-weight: 800; cursor: pointer;
     }
-    table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
-    th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid #24142e; }
-    th { color: var(--muted); font-size: 0.66rem; text-transform: uppercase; }
-    .logs { background: #050208; border: 1px solid var(--border); border-radius: 10px; padding: 10px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 0.72rem; color: #d4d4d8; line-height: 1.5; }
+    .btn-del {
+      background: rgba(255, 42, 95, 0.16); border: 1px solid var(--crimson); color: #fda4af;
+      padding: 5px 10px; border-radius: 8px; font-size: 0.72rem; font-weight: 800; cursor: pointer;
+    }
+
+    /* COMMAND & SETTINGS INPUTS */
+    .chip-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .chip { background: #1c1026; border: 1px solid #3c204f; color: #e4e4e7; font-size: 0.7rem; font-weight: 800; padding: 5px 10px; border-radius: 99px; cursor: pointer; }
+    .chip:hover { border-color: var(--crimson); color: #fff; }
+
+    .input-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+    .input-grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 10px; }
+    label { display: block; font-size: 0.7rem; color: var(--muted); margin-bottom: 4px; font-weight: 700; }
+    input { width: 100%; background: #060309; border: 1px solid #3c204f; color: var(--text); padding: 9px 11px; border-radius: 9px; font-size: 0.83rem; font-weight: 700; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.77rem; }
+    th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid #24142e; font-variant-numeric: tabular-nums; }
+    th { color: var(--muted); font-size: 0.67rem; text-transform: uppercase; }
+    .logs { background: #040207; border: 1px solid var(--border); border-radius: 11px; padding: 11px; height: 210px; overflow-y: auto; font-family: monospace; font-size: 0.74rem; color: #e4e4e7; line-height: 1.55; }
   </style>
 </head>
 <body>
+<div class="wrap">
 
-  <div class="top-bar">
-    <div class="title-row">
-      <div class="logo">🩸 BEARSKIMMER <span class="badge">v2.0 AUTO-STEP-UP</span></div>
-      <div style="font-size:0.72rem;color:var(--neon);font-weight:800;" id="statusTxt">● Scanning Live</div>
+  <!-- HERO HEADER -->
+  <div class="hero">
+    <div class="hero-top">
+      <div>
+        <div class="logo">🩸 BEARSKIMMER <span class="badge">v3.0 PRO TERMINAL</span></div>
+        <div class="sub">Autonomous 1x Short Skimmer • Auto-Step-Up Bar Mover (+2% Pump Rescuer) • Custom Trade & Bankroll Control</div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-install" onclick="installApp()" id="installBtn">📲 Install Phone App</button>
+        <button class="btn btn-crimson" onclick="toggleAP()" id="apBtn">🤖 Auto-Pilot: ON</button>
+        <button class="btn btn-amber" onclick="toggleMode()" id="modeBtn">🔀 Mode: PAPER</button>
+        <button class="btn btn-outline" onclick="manualScan()">⚡ Sweep Market</button>
+      </div>
     </div>
-    <div class="sub">If a coin pumps +2%, the bot automatically adds $5 at the higher price to raise your Entry & Target Bar!</div>
-    <div class="btn-row">
-      <button class="btn btn-neon" onclick="installApp()" id="installBtn">📲 Install App</button>
-      <button class="btn btn-crimson" onclick="toggleAP()" id="apBtn">🤖 Auto-Pilot: ON</button>
-      <button class="btn btn-outline" onclick="rebalanceSlots()">🔄 Free Stuck Slots (Keep Profit)</button>
+    <div class="strip">
+      <div id="apiStatus" style="font-weight:800; color:var(--neon);">● Paper Simulation Active</div>
+      <div>Auto-Step-Up Rule: <strong>Coin Pumps +<span id="ruleTrig">2.0</span>% → Adds $<span id="ruleAdd">5</span> Short to Raise Entry & Target Bar Higher</strong></div>
+      <div>Last Sweep: <strong id="lastUpdate">--:--:--</strong> (<strong class="c-crimson" id="scanMs">0</strong>ms | Cycle #<span id="cycleNum">0</span>)</div>
     </div>
   </div>
 
-  <div class="score-grid">
+  <!-- API KEY SYNC & USDT BANKROLL RESET PANELS -->
+  <div class="top-panels">
+    <div class="panel-card">
+      <div class="sec-title">
+        <span>🔑 Gate.io v4 Futures API Connection</span>
+        <span id="apiRightBadge" style="font-size:0.7rem;color:var(--amber);">Paste Keys for Live Mode</span>
+      </div>
+      <div class="api-grid">
+        <div>
+          <label>Gate.io v4 API Key</label>
+          <input type="password" id="apiKeyInput" placeholder="Paste Gate.io API Key..." autocomplete="off" />
+        </div>
+        <div>
+          <label>Gate.io v4 API Secret</label>
+          <input type="password" id="apiSecretInput" placeholder="Paste Gate.io API Secret..." autocomplete="off" />
+        </div>
+        <button class="btn btn-install" style="height:38px;" onclick="syncApiKeys()" id="syncBtn">🔗 Sync Keys</button>
+      </div>
+    </div>
+
+    <div class="panel-card">
+      <div class="sec-title">
+        <span>💰 Reset / Set Virtual USDT Balance</span>
+        <button class="btn-del" style="padding:3px 8px;font-size:0.66rem;" onclick="resetProfitVault()">🧹 Zero Profit Vault</button>
+      </div>
+      <div style="display:grid; grid-template-columns: 1fr auto auto; gap:8px; align-items:end;">
+        <div>
+          <label>Starting Paper USDT Balance ($)</label>
+          <input type="number" id="resetUsdtInput" step="10" value="100" placeholder="e.g. 100" />
+        </div>
+        <button class="btn btn-crimson" style="height:38px;" onclick="resetUsdtBalance(false)">🔄 Full Reset</button>
+        <button class="btn btn-outline" style="height:38px;" onclick="resetUsdtBalance(true)">♻️ Free Slots Only</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4 SCOREBOARD CARDS -->
+  <div class="grid-4">
     <div class="card">
-      <div class="lbl">Bear Profit Vault</div>
+      <div class="lbl">Active Short Margin Deployed</div>
+      <div class="val c-crimson" id="deployedVal">$0.00</div>
+      <div class="sub">Open 1x Shorts: <strong id="posCount">0</strong> / <span id="maxPos">5</span></div>
+    </div>
+    <div class="card">
+      <div class="lbl">Total Portfolio (Shorts + Free Cash)</div>
+      <div class="val c-cyan" id="totalPort">$100.0000</div>
+      <div class="sub">Free Step-Up USDT Reserve: <strong id="freeUsdt" class="c-neon">$100.00</strong></div>
+    </div>
+    <div class="card">
+      <div class="lbl">Bear Skim Profit Vault</div>
       <div class="val c-neon" id="profitVault">+$0.0000</div>
-      <div class="sub">Completed Wins: <strong id="winCount">0</strong></div>
+      <div class="sub">Completed Red-Candle Wins: <strong id="skimCount">0</strong></div>
     </div>
     <div class="card">
-      <div class="lbl">Total Portfolio Value</div>
-      <div class="val c-cyan" id="totalPort">$100.00</div>
-      <div class="sub">Step-Up Cash Reserve: <strong id="freeCash">$50.00</strong></div>
+      <div class="lbl">Target Drop & Step-Up Bar</div>
+      <div class="val c-amber" id="dropNeededBox">-1.12% Drop</div>
+      <div class="sub">Auto-Raises Bar on <strong>+<span id="cardTrig">2.0</span>% Pump</strong></div>
     </div>
   </div>
 
-  <div class="card" style="margin-bottom:12px;">
-    <div class="sec-title">
-      <span>🩸 Active Shorts (<span id="posCount">0</span>/<span id="maxPos">5</span>)</span>
-      <span style="font-size:0.7rem;color:var(--cyan);">Auto-Raises Bar on +2% Pump</span>
+  <!-- MAIN WORKSPACE: LEFT = ACTIVE SHORTS | RIGHT = COMMAND NEW SHORT & ENGINE SETTINGS -->
+  <div class="grid-main">
+    <div class="card">
+      <div class="sec-title">
+        <span>🩸 Active 1x Short Positions (Win When Price Falls ↓)</span>
+        <span style="font-size:0.7rem;color:var(--cyan);">Tap "🔼 Raise Bar" Anytime</span>
+      </div>
+      <div id="positionsBox"></div>
     </div>
-    <div id="positionsBox"></div>
+
+    <div>
+      <!-- MANUAL SHORT COMMAND DECK -->
+      <div class="card" style="margin-bottom:14px;">
+        <div class="sec-title">➕ Command Custom 1x Short Position</div>
+        <div class="chip-bar">
+          <span class="chip" onclick="fillPair('SUI_USDT')">SUI</span>
+          <span class="chip" onclick="fillPair('PEPE_USDT')">PEPE</span>
+          <span class="chip" onclick="fillPair('DOGE_USDT')">DOGE</span>
+          <span class="chip" onclick="fillPair('SOL_USDT')">SOL</span>
+          <span class="chip" onclick="fillPair('FET_USDT')">FET</span>
+          <span class="chip" onclick="fillPair('AVAX_USDT')">AVAX</span>
+          <span class="chip" onclick="fillPair('DOT_USDT')">DOT</span>
+          <span class="chip" onclick="fillPair('ARB_USDT')">ARB</span>
+          <span class="chip" onclick="fillPair('WIF_USDT')">WIF</span>
+          <span class="chip" onclick="fillPair('NEAR_USDT')">NEAR</span>
+          <span class="chip" onclick="fillPair('XRP_USDT')">XRP</span>
+          <span class="chip" onclick="fillPair('ADA_USDT')">ADA</span>
+        </div>
+        <div class="input-grid-2">
+          <div>
+            <label>Token Symbol (Any Gate.io Futures Pair)</label>
+            <input type="text" id="customPairInput" placeholder="e.g. SUI, PEPE, DOGE" />
+          </div>
+          <div>
+            <label>Short Amount to Deploy (USDT)</label>
+            <input type="number" id="customAmtInput" step="1" value="10" placeholder="e.g. 10" />
+          </div>
+        </div>
+        <button class="btn btn-crimson" style="width:100%;padding:11px;" onclick="launchCustomShort()">🩸 Launch Custom 1x Short Now</button>
+      </div>
+
+      <!-- ENGINE PARAMETERS -->
+      <div class="card">
+        <div class="sec-title">⚙️ Auto-Pilot & Step-Up Bar Parameters</div>
+        <div class="input-grid-3">
+          <div>
+            <label>Auto-Short Size ($)</label>
+            <input type="number" id="cfgSize" step="1" value="10" />
+          </div>
+          <div>
+            <label>Max Active Shorts</label>
+            <input type="number" id="cfgMaxPos" step="1" value="5" />
+          </div>
+          <div>
+            <label>Skim Profit Target (%)</label>
+            <input type="number" id="cfgTarget" step="0.1" value="1.0" />
+          </div>
+        </div>
+        <div class="input-grid-3">
+          <div>
+            <label>Step-Up Trigger Pump (%)</label>
+            <input type="number" id="cfgStepTrig" step="0.2" value="2.0" />
+          </div>
+          <div>
+            <label>Step-Up Add Amount ($)</label>
+            <input type="number" id="cfgStepAdd" step="1" value="5" />
+          </div>
+          <div>
+            <label>Min Bear Score (40-95)</label>
+            <input type="number" id="cfgBear" step="1" value="68" />
+          </div>
+        </div>
+        <button class="btn btn-install" style="width:100%;padding:11px;" onclick="saveConfig()">💾 Save Engine & Step-Up Settings</button>
+      </div>
+    </div>
   </div>
 
-  <div class="card" style="margin-bottom:12px;">
-    <div class="sec-title">💎 Recent Profit Skims Banked</div>
-    <div style="max-height:190px; overflow-y:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Coin</th>
-            <th>Drop</th>
-            <th>Entry Bar → Sold</th>
-            <th>Profit</th>
-          </tr>
-        </thead>
-        <tbody id="ledgerBody"></tbody>
-      </table>
+  <!-- BOTTOM WORKSPACE: LIVE 16-MARKET RADAR + COMPLETED PROFIT LEDGER -->
+  <div class="grid-main">
+    <div class="card">
+      <div class="sec-title">
+        <span>📡 16-Market Bearish Rejection Radar</span>
+        <span style="font-size:0.7rem;color:var(--muted);">Score >= 68 Auto-Shorts</span>
+      </div>
+      <div style="overflow-x:auto; max-height:260px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Contract</th>
+              <th>Live Price (24h)</th>
+              <th>Bear Score</th>
+              <th>5m RSI</th>
+              <th>Sellers %</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="radarBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-title">💎 Verified Bear Skim Profit Ledger</div>
+      <div style="max-height:260px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Contract</th>
+              <th>Drop</th>
+              <th>Entry Bar → Covered</th>
+              <th>Profit</th>
+            </tr>
+          </thead>
+          <tbody id="ledgerBody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
   <div class="card">
-    <div class="sec-title">📡 Live Bot Activity Log</div>
+    <div class="sec-title">📡 Real-Time Short & Step-Up Telemetry Logs</div>
     <div class="logs" id="logBox"></div>
   </div>
+
+</div>
 
 <script>
   let deferredPrompt = null;
@@ -784,7 +1258,7 @@ HTML_UI = """
       deferredPrompt.prompt();
       deferredPrompt = null;
     } else {
-      alert("Tap your browser's top-right menu (⋮) and tap 'Add to Home screen' or 'Install app'.");
+      alert("To install BearSkimmer Pro on your phone: Tap your browser menu (⋮) and select 'Install app' or 'Add to Home screen'.");
     }
   }
 
@@ -796,13 +1270,62 @@ HTML_UI = """
     return '$' + v.toFixed(4);
   }
 
-  async function toggleAP() {
-    await fetch('/api/toggle_autopilot', { method: 'POST' });
+  function fillPair(p) {
+    document.getElementById('customPairInput').value = p;
+  }
+
+  async function syncApiKeys() {
+    const btn = document.getElementById('syncBtn');
+    const k = document.getElementById('apiKeyInput').value.trim();
+    const s = document.getElementById('apiSecretInput').value.trim();
+    btn.innerText = 'Syncing...';
+    const r = await fetch('/api/sync_keys', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ api_key: k, api_secret: s })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('apiKeyInput').value = '';
+      document.getElementById('apiSecretInput').value = '';
+      btn.innerText = '✅ Synced';
+    } else {
+      alert('API Notice: ' + (d.error || 'Check keys'));
+      btn.innerText = '❌ Retry';
+    }
+    await refresh();
+    setTimeout(() => { btn.innerText = '🔗 Sync Keys'; }, 2500);
+  }
+
+  async function resetUsdtBalance(keepProfits) {
+    const amt = document.getElementById('resetUsdtInput').value || 100;
+    await fetch('/api/reset_usdt_balance', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ amount_usdt: amt, keep_profits: keepProfits })
+    });
     await refresh();
   }
 
-  async function rebalanceSlots() {
-    await fetch('/api/reset_paper', { method: 'POST' });
+  async function resetProfitVault() {
+    await fetch('/api/reset_profit_vault', { method: 'POST' });
+    await refresh();
+  }
+
+  async function launchCustomShort(pairOverride) {
+    const pair = pairOverride || document.getElementById('customPairInput').value.trim();
+    const amt = document.getElementById('customAmtInput').value || 10;
+    if (!pair) {
+      alert('Select or type a token symbol first.');
+      return;
+    }
+    const r = await fetch('/api/manual_short', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ pair, amount_usdt: amt })
+    });
+    const d = await r.json();
+    if (!d.ok) alert(d.error || 'Could not open short');
     await refresh();
   }
 
@@ -826,63 +1349,150 @@ HTML_UI = """
     await refresh();
   }
 
+  async function toggleAP() {
+    await fetch('/api/toggle_autopilot', { method: 'POST' });
+    await refresh();
+  }
+
+  async function toggleMode() {
+    await fetch('/api/toggle_mode', { method: 'POST' });
+    await refresh();
+  }
+
+  async function manualScan() {
+    await fetch('/api/scan_now', { method: 'POST' });
+    await refresh();
+  }
+
+  async function saveConfig() {
+    await fetch('/api/update_config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        slot_size_usdt: document.getElementById('cfgSize').value,
+        max_short_slots: document.getElementById('cfgMaxPos').value,
+        skim_profit_pct: document.getElementById('cfgTarget').value,
+        step_up_trigger_pct: document.getElementById('cfgStepTrig').value,
+        step_up_size_usdt: document.getElementById('cfgStepAdd').value,
+        min_bear_score: document.getElementById('cfgBear').value
+      })
+    });
+    await refresh();
+  }
+
+  let cfgLoaded = false;
   async function refresh() {
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
 
-      document.getElementById('statusTxt').innerText = '● Live Sweep ' + s.last_update;
-      document.getElementById('apBtn').innerText = s.auto_pilot ? '🤖 Auto-Pilot: ON' : '✋ Auto-Pilot: PAUSED';
+      if (!cfgLoaded) {
+        document.getElementById('cfgSize').value = s.slot_size_usdt || 10;
+        document.getElementById('cfgMaxPos').value = s.max_short_slots || 5;
+        document.getElementById('cfgTarget').value = s.skim_profit_pct || 1.0;
+        document.getElementById('cfgStepTrig').value = s.step_up_trigger_pct || 2.0;
+        document.getElementById('cfgStepAdd').value = s.step_up_size_usdt || 5;
+        document.getElementById('cfgBear').value = s.min_bear_score || 68;
+        document.getElementById('resetUsdtInput').value = s.paper_starting_bankroll || 100;
+        cfgLoaded = true;
+      }
+
+      document.getElementById('lastUpdate').innerText = s.last_update;
+      document.getElementById('scanMs').innerText = s.last_scan_ms;
+      document.getElementById('cycleNum').innerText = s.cycle_count;
+      document.getElementById('ruleTrig').innerText = Number(s.step_up_trigger_pct || 2.0).toFixed(1);
+      document.getElementById('cardTrig').innerText = Number(s.step_up_trigger_pct || 2.0).toFixed(1);
+      document.getElementById('ruleAdd').innerText = Number(s.step_up_size_usdt || 5).toFixed(0);
+
+      const needDrop = (Number(s.skim_profit_pct || 1.0) + Number(s.futures_fee_buffer_pct || 0.12)).toFixed(2);
+      document.getElementById('dropNeededBox').innerText = '-' + needDrop + '% Drop';
+
+      document.getElementById('apBtn').innerText = s.auto_pilot ? '🤖 Auto-Pilot: ON' : '✋ Auto-Pilot: MANUAL';
+      const modeBtn = document.getElementById('modeBtn');
+      modeBtn.innerText = s.mode === 'LIVE' ? '🔀 Mode: LIVE FUTURES' : '🔀 Mode: PAPER';
+      modeBtn.className = s.mode === 'LIVE' ? 'btn btn-install' : 'btn btn-amber';
+
+      document.getElementById('apiStatus').innerText = '● ' + (s.api_status_msg || '');
+      document.getElementById('apiRightBadge').innerText = s.api_connected ? '✅ Gate.io Connected' : 'Paste Keys for Live Mode';
 
       const posMap = s.short_positions || {};
       const keys = Object.keys(posMap);
       let sumEq = 0;
       keys.forEach(k => { sumEq += Number(posMap[k].current_equity_usdt || 0); });
 
-      const free = Number(s.paper_usdt_balance || 0);
-      document.getElementById('profitVault').innerText = '+$' + Number(s.stats.paper_profit_usdt || 0).toFixed(4);
-      document.getElementById('winCount').innerText = s.stats.paper_skims || 0;
-      document.getElementById('totalPort').innerText = '$' + (sumEq + free).toFixed(2);
-      document.getElementById('freeCash').innerText = '$' + free.toFixed(2);
+      const freeCash = s.mode === 'LIVE' ? Number(s.live_futures_usdt || 0) : Number(s.paper_usdt_balance || 0);
+      document.getElementById('deployedVal').innerText = '$' + sumEq.toFixed(2);
       document.getElementById('posCount').innerText = keys.length;
       document.getElementById('maxPos').innerText = s.max_short_slots || 5;
+      document.getElementById('totalPort').innerText = '$' + (sumEq + freeCash).toFixed(4);
+      document.getElementById('freeUsdt').innerText = '$' + freeCash.toFixed(2);
+
+      const prof = s.mode === 'LIVE' ? s.stats.live_profit_usdt : s.stats.paper_profit_usdt;
+      const skims = s.mode === 'LIVE' ? s.stats.live_skims : s.stats.paper_skims;
+      document.getElementById('profitVault').innerText = '+$' + Number(prof || 0).toFixed(4);
+      document.getElementById('skimCount').innerText = skims || 0;
 
       const pBox = document.getElementById('positionsBox');
       if (keys.length === 0) {
-        pBox.innerHTML = `<div style="text-align:center;color:#9ca3af;padding:16px;font-size:0.8rem;">Scanning for high-score short setups...</div>`;
+        pBox.innerHTML = `<div style="text-align:center;color:#9ca3af;padding:22px;font-size:0.82rem;">No active shorts — Auto-Pilot is scanning or command one on the right.</div>`;
       } else {
         pBox.innerHTML = keys.map(k => {
           const p = posMap[k];
           const pnl = Number(p.pnl_pct || 0);
           const pnlSign = pnl >= 0 ? '+' : '';
+          const pnlUsdt = Number(p.pnl_usdt || 0);
           const steps = Number(p.step_ups_done || 0);
+          const prog = Math.max(0, Math.min(100, (pnl / Number(s.skim_profit_pct || 1.0)) * 100));
 
           return `
             <div class="pos-card">
-              <div style="display:flex;justify-content:space-between;align-items:center;">
-                <div>
-                  <strong>${p.pair}</strong>
-                  <span class="step-badge">$${Number(p.margin_usdt).toFixed(0)} Short (Bar Raised ${steps}x)</span>
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <strong style="font-size:1rem;">${p.pair}</strong>
+                  <span class="short-pill">$${Number(p.margin_usdt).toFixed(0)} Short</span>
+                  <span class="step-pill">Bar Raised ${steps}x</span>
                 </div>
-                <div style="font-weight:900;color:${pnl >= 0 ? '#00f5a0' : '#f59e0b'}">
-                  ${pnlSign}${pnl.toFixed(2)}% ($${Number(p.pnl_usdt || 0).toFixed(2)})
+                <div style="font-weight:900;font-size:0.9rem;color:${pnl >= 0 ? '#00f5a0' : '#f59e0b'}">
+                  ${pnlSign}${pnl.toFixed(2)}% (${pnlSign}$${pnlUsdt.toFixed(2)})
                 </div>
               </div>
 
-              <div class="bar-box">
-                <div>
-                  <div>Entry Bar: <strong>${fmtPx(p.entry_price)}</strong> → Target: <strong class="c-neon">${fmtPx(p.target_buyback_price)}</strong></div>
-                  <div style="color:#9ca3af;font-size:0.7rem;margin-top:2px;">Live Price: ${fmtPx(p.last_price)} (${p.status})</div>
-                </div>
-                <div style="display:flex;gap:6px;align-items:center;">
-                  <button class="btn-step" onclick="stepUpNow('${p.pair}')">🔼 Raise Bar (+$5)</button>
-                  <button onclick="closeSlot('${p.pair}')" style="background:none;border:none;color:#ff2a5f;font-weight:900;cursor:pointer;">✖</button>
-                </div>
+              <div class="metrics-box">
+                <div>Entry Bar: <strong>${fmtPx(p.entry_price)}</strong></div>
+                <div>Buyback Target: <strong class="c-neon">${fmtPx(p.target_buyback_price)}</strong></div>
+                <div>Live Price: <strong>${fmtPx(p.last_price)}</strong></div>
+                <div>Coin Move: <strong style="color:${p.coin_move_pct <= 0 ? '#00f5a0' : '#f59e0b'}">${p.coin_move_pct > 0 ? '+' : ''}${Number(p.coin_move_pct || 0).toFixed(2)}%</strong></div>
+              </div>
+
+              <div style="display:flex;justify-content:space-between;font-size:0.71rem;color:var(--muted);">
+                <span>${p.status}</span>
+                <strong class="c-neon">${prog.toFixed(0)}% to Skim</strong>
+              </div>
+              <div class="track"><div class="fill" style="width:${prog.toFixed(1)}%"></div></div>
+
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
+                <button class="btn-step" onclick="stepUpNow('${p.pair}')">🔼 Raise Bar (+$${Number(s.step_up_size_usdt || 5).toFixed(0)})</button>
+                <button class="btn-del" onclick="closeSlot('${p.pair}')">✖ Close Short</button>
               </div>
             </div>
           `;
         }).join('');
       }
+
+      const rb = document.getElementById('radarBody');
+      rb.innerHTML = (s.radar || []).map(item => {
+        const chgSign = item.change_24h >= 0 ? '+' : '';
+        return `
+          <tr>
+            <td><strong>${item.pair}</strong></td>
+            <td>${fmtPx(item.price)} <span style="color:${item.change_24h < 0 ? '#ff2a5f' : '#00f5a0'}">(${chgSign}${item.change_24h}%)</span></td>
+            <td><span class="short-pill">${item.bear_score}/100</span></td>
+            <td>${item.rsi_14}</td>
+            <td>${item.ask_sell_pct}%</td>
+            <td><button class="btn btn-outline" style="padding:4px 9px;font-size:0.7rem;" onclick="launchCustomShort('${item.pair}')">🩸 Short</button></td>
+          </tr>
+        `;
+      }).join('');
 
       const lb = document.getElementById('ledgerBody');
       if (s.skim_ledger && s.skim_ledger.length > 0) {
@@ -890,13 +1500,13 @@ HTML_UI = """
           <tr>
             <td>${t.time}</td>
             <td><strong>${t.pair}</strong></td>
-            <td class="c-crimson">${t.drop}</td>
+            <td class="c-crimson"><strong>${t.drop}</strong></td>
             <td>${t.short_to_cover}</td>
             <td class="c-neon"><strong>${t.profit}</strong></td>
           </tr>
         `).join('');
       } else {
-        lb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#9ca3af;padding:14px;">No closed skims yet.</td></tr>`;
+        lb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#9ca3af;padding:18px;">Waiting for next red-candle skim...</td></tr>`;
       }
 
       document.getElementById('logBox').innerHTML = (s.logs || []).join('<br/>');
